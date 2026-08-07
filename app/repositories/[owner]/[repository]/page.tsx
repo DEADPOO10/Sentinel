@@ -4,7 +4,7 @@ import { ChevronRight, FileCode2, GitBranch } from "lucide-react";
 import { notFound } from "next/navigation";
 import { requireUser } from "@/lib/auth/session";
 import { getGitHubPackageJson, isValidGitHubRepository, type GitHubPackageJsonResult } from "@/lib/github/package-json";
-import type { CheckedPackageManifest, DependencyStatus } from "@/lib/npm/dependency-versions";
+import type { CheckedPackageManifest, DependencyStatus, ReleaseChangeType, ReleaseRisk } from "@/lib/npm/dependency-versions";
 import { SiteNavigation } from "@/components/site-navigation";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -37,7 +37,7 @@ function RepositoryPackageContent({ result }: { result: Exclude<GitHubPackageJso
 }
 
 function PackageManifestContent({ manifest }: { manifest: CheckedPackageManifest }) {
-  return <><div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-3"><MetadataCard label="Package name" value={manifest.name ?? "Not specified"} /><MetadataCard label="Package version" value={manifest.version ?? "Not specified"} /><MetadataCard label="Total dependencies" value={String(manifest.summary.total)} /><MetadataCard label="Up to date" value={String(manifest.summary.upToDate)} /><MetadataCard label="Updates available" value={String(manifest.summary.updatesAvailable)} /><MetadataCard label="Ahead of npm latest" value={String(manifest.summary.aheadOfNpmLatest)} /><MetadataCard label="Unknown" value={String(manifest.summary.unknown)} /></div><Card className="mt-8"><CardHeader><div className="flex items-center gap-2"><FileCode2 className="h-4 w-4 text-[#b45309]" /><CardTitle>Declared dependencies</CardTitle></div><CardDescription>Latest stable versions are read from npm. Non-semver references and unavailable packages are marked unknown.</CardDescription></CardHeader><CardContent className="overflow-x-auto">{manifest.dependencies.length === 0 ? <p className="text-sm text-[#6b7280]">This package.json does not declare any dependencies.</p> : <table className="w-full min-w-[720px] text-left text-sm"><thead className="border-b border-[#f3e8d5] text-xs font-medium uppercase tracking-[.12em] text-[#9ca3af]"><tr><th className="pb-3">Package</th><th className="pb-3">Declared version</th><th className="pb-3">Latest version</th><th className="pb-3">Type</th><th className="pb-3 text-right">Status</th></tr></thead><tbody>{manifest.dependencies.map((dependency) => <tr key={`${dependency.type}-${dependency.name}`} className="border-b border-[#f3e8d5]/70 last:border-0"><td className="py-4 font-medium text-[#111827]">{dependency.name}</td><td className="py-4 font-mono text-xs text-[#6b7280]">{dependency.version}</td><td className="py-4 font-mono text-xs text-[#6b7280]">{dependency.latestVersion ?? "Unavailable"}</td><td className="py-4"><Badge variant="info">{dependency.type}</Badge></td><td className="py-4 text-right"><DependencyStatusBadge status={dependency.status} /></td></tr>)}</tbody></table>}</CardContent></Card></>;
+  return <><div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-3"><MetadataCard label="Package name" value={manifest.name ?? "Not specified"} /><MetadataCard label="Package version" value={manifest.version ?? "Not specified"} /><MetadataCard label="Total dependencies" value={String(manifest.summary.total)} /><MetadataCard label="Up to date" value={String(manifest.summary.upToDate)} /><MetadataCard label="Updates available" value={String(manifest.summary.updatesAvailable)} /><MetadataCard label="Major updates" value={String(manifest.summary.majorUpdates)} /><MetadataCard label="Minor updates" value={String(manifest.summary.minorUpdates)} /><MetadataCard label="Patch updates" value={String(manifest.summary.patchUpdates)} /><MetadataCard label="High risk updates" value={String(manifest.summary.highRiskUpdates)} /><MetadataCard label="Ahead of npm latest" value={String(manifest.summary.aheadOfNpmLatest)} /><MetadataCard label="Unknown" value={String(manifest.summary.unknown)} /></div><Card className="mt-8"><CardHeader><div className="flex items-center gap-2"><FileCode2 className="h-4 w-4 text-[#b45309]" /><CardTitle>Declared dependencies</CardTitle></div><CardDescription>Latest stable versions and publication dates are read from npm. Change type and risk apply only to available updates.</CardDescription></CardHeader><CardContent className="overflow-x-auto">{manifest.dependencies.length === 0 ? <p className="text-sm text-[#6b7280]">This package.json does not declare any dependencies.</p> : <table className="w-full min-w-[980px] text-left text-sm"><thead className="border-b border-[#f3e8d5] text-xs font-medium uppercase tracking-[.12em] text-[#9ca3af]"><tr><th className="pb-3">Package</th><th className="pb-3">Current version</th><th className="pb-3">Latest version</th><th className="pb-3">Type</th><th className="pb-3">Change type</th><th className="pb-3">Risk</th><th className="pb-3 text-right">Status</th></tr></thead><tbody>{manifest.dependencies.map((dependency) => <tr key={`${dependency.type}-${dependency.name}`} className="border-b border-[#f3e8d5]/70 last:border-0"><td className="py-4 font-medium text-[#111827]">{dependency.name}</td><td className="py-4 font-mono text-xs text-[#6b7280]">{dependency.version}</td><td className="py-4"><p className="font-mono text-xs text-[#6b7280]">{dependency.latestVersion ?? "Unavailable"}</p>{dependency.publishedAt && <time dateTime={dependency.publishedAt} className="mt-1 block text-xs text-[#9ca3af]">Published {formatPublishedAt(dependency.publishedAt)}</time>}</td><td className="py-4"><Badge variant="info">{dependency.type}</Badge></td><td className="py-4"><ChangeTypeBadge changeType={dependency.changeType} /></td><td className="py-4"><RiskBadge risk={dependency.risk} /></td><td className="py-4 text-right"><DependencyStatusBadge status={dependency.status} /></td></tr>)}</tbody></table>}</CardContent></Card></>;
 }
 
 function MetadataCard({ label, value }: { label: string; value: string }) {
@@ -54,6 +54,23 @@ function DependencyStatusBadge({ status }: { status: DependencyStatus }) {
   const detail = details[status];
 
   return <Badge variant={detail.variant}>{detail.label}</Badge>;
+}
+
+function ChangeTypeBadge({ changeType }: { changeType: ReleaseChangeType | null }) {
+  if (!changeType) return <span className="text-xs text-[#9ca3af]">—</span>;
+
+  return <Badge variant={changeType === "major" ? "danger" : changeType === "minor" ? "warning" : "success"}>{changeType[0].toUpperCase()}{changeType.slice(1)}</Badge>;
+}
+
+function RiskBadge({ risk }: { risk: ReleaseRisk | null }) {
+  if (!risk) return <span className="text-xs text-[#9ca3af]">—</span>;
+
+  return <Badge variant={risk === "high" ? "danger" : risk === "medium" ? "warning" : "success"}>{risk[0].toUpperCase()}{risk.slice(1)} risk</Badge>;
+}
+
+function formatPublishedAt(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "Unavailable" : new Intl.DateTimeFormat("en", { dateStyle: "medium" }).format(date);
 }
 
 function NoPackageJsonState({ invalid }: { invalid: boolean }) {
