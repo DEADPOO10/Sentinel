@@ -1,4 +1,5 @@
 import { getGitHubAccessTokenForCurrentUser } from "@/lib/github/repositories";
+import { checkDependencyVersions, type CheckedPackageManifest } from "@/lib/npm/dependency-versions";
 
 const GITHUB_API_ORIGIN = "https://api.github.com/";
 const GITHUB_OWNER_PATTERN = /^[A-Za-z\d](?:[A-Za-z\d]|-(?=[A-Za-z\d])){0,38}$/;
@@ -23,7 +24,7 @@ export type PackageManifest = {
 };
 
 export type GitHubPackageJsonResult =
-  | { kind: "ready"; repository: GitHubRepositoryDetails; manifest: PackageManifest }
+  | { kind: "ready"; repository: GitHubRepositoryDetails; manifest: CheckedPackageManifest }
   | { kind: "no-package-json"; repository: GitHubRepositoryDetails }
   | { kind: "invalid-package-json"; repository: GitHubRepositoryDetails }
   | { kind: "not-found" }
@@ -65,7 +66,7 @@ export async function getGitHubPackageJson(owner: string, repository: string): P
     if (!packageJsonContent) return { kind: "no-package-json", repository: repositoryDetails };
 
     const manifest = parsePackageManifest(packageJsonContent);
-    return manifest ? { kind: "ready", repository: repositoryDetails, manifest } : { kind: "invalid-package-json", repository: repositoryDetails };
+    return manifest ? { kind: "ready", repository: repositoryDetails, manifest: await checkDependencyVersions(manifest) } : { kind: "invalid-package-json", repository: repositoryDetails };
   } catch (error) {
     return { kind: "error", error: getUserFacingError(error) };
   }
