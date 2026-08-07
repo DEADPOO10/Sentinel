@@ -10,7 +10,7 @@ export const authConfig = {
     GitHub({
       authorization: {
         params: {
-          scope: "read:user user:email",
+          scope: "read:user user:email repo",
         },
       },
     }),

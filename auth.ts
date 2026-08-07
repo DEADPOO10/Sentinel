@@ -9,8 +9,14 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   callbacks: {
     ...authConfig.callbacks,
     jwt({ token, profile, account }) {
-      if (account?.provider === "github" && isGitHubProfile(profile)) {
-        token.username = profile.login;
+      if (account?.provider === "github") {
+        if (isGitHubProfile(profile)) {
+          token.username = profile.login;
+        }
+
+        if (typeof account.access_token === "string") {
+          token.githubAccessToken = account.access_token;
+        }
       }
 
       return token;
