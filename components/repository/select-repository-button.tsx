@@ -1,10 +1,8 @@
-"use client";
-
-import { useState } from "react";
+import Link from "next/link";
 import { Button } from "@/components/ui/button";
 
-export function SelectRepositoryButton({ repositoryName }: { repositoryName: string }) {
-  const [isSelected, setIsSelected] = useState(false);
+export function SelectRepositoryButton({ owner, repositoryName }: { owner: string; repositoryName: string }) {
+  const href = `/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repositoryName)}`;
 
-  return <Button type="button" variant={isSelected ? "outline" : "default"} size="sm" aria-pressed={isSelected} aria-label={`${isSelected ? "Deselect" : "Select"} ${repositoryName}`} onClick={() => setIsSelected((selected) => !selected)}>{isSelected ? "Selected" : "Select repository"}</Button>;
+  return <Button asChild size="sm"><Link href={href} aria-label={`Select ${owner}/${repositoryName}`}>Select repository</Link></Button>;
 }

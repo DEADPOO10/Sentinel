@@ -20,7 +20,7 @@ class GitHubApiError extends Error {
 }
 
 export async function getGitHubRepositoriesForCurrentUser(): Promise<GitHubRepositoriesResult> {
-  const accessToken = await getGitHubAccessToken();
+  const accessToken = await getGitHubAccessTokenForCurrentUser();
   if (!accessToken) {
     return { error: "Your GitHub authorization needs to be refreshed. Sign out, then connect GitHub again." };
   }
@@ -32,7 +32,7 @@ export async function getGitHubRepositoriesForCurrentUser(): Promise<GitHubRepos
   }
 }
 
-async function getGitHubAccessToken() {
+export async function getGitHubAccessTokenForCurrentUser() {
   const secret = process.env.AUTH_SECRET ?? process.env.NEXTAUTH_SECRET;
   if (!secret) return null;
 
