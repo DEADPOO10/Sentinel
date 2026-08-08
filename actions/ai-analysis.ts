@@ -1,12 +1,13 @@
 "use server";
 
 import { requireUser } from "@/lib/auth/session";
+import { getRepositoryDependencyUsage, type RepositoryUsageContext } from "@/lib/github/dependency-usage";
 import { getGitHubPackageJson, isValidGitHubRepository } from "@/lib/github/package-json";
 import { analyzeDependencyImpact, type DependencyImpactAnalysis } from "@/lib/openai/impact-analysis";
 
 const dependencyTypes = new Set(["dependency", "devDependency", "peerDependency", "optionalDependency"]);
 
-export type DependencyImpactAnalysisActionResult = { analysis: DependencyImpactAnalysis & { risk: "low" | "medium" | "high" } } | { error: string };
+export type DependencyImpactAnalysisActionResult = { analysis: DependencyImpactAnalysis & { risk: "low" | "medium" | "high"; repositoryUsage: RepositoryUsageContext } } | { error: string };
 
 export async function requestDependencyImpactAnalysis(input: { owner: string; repository: string; dependencyName: string; dependencyType: string }): Promise<DependencyImpactAnalysisActionResult> {
   await requireUser();
@@ -23,6 +24,7 @@ export async function requestDependencyImpactAnalysis(input: { owner: string; re
     return { error: "AI analysis is available only for dependencies with an update available." };
   }
 
+  const repositoryUsage = await getRepositoryDependencyUsage(result.repository.owner, result.repository.name, dependency.name);
   const analysisResult = await analyzeDependencyImpact({
     repository: {
       owner: result.repository.owner,
@@ -39,10 +41,11 @@ export async function requestDependencyImpactAnalysis(input: { owner: string; re
       risk: dependency.risk,
       dependencyType: dependency.type,
     },
+    repositoryUsage,
   });
 
   if ("error" in analysisResult) return analysisResult;
-  return { analysis: { ...analysisResult.analysis, risk: dependency.risk } };
+  return { analysis: { ...analysisResult.analysis, risk: dependency.risk, repositoryUsage } };
 }
 
 function isSafeDependencyName(value: string) {
