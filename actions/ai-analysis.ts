@@ -89,38 +89,63 @@ export async function requestDependencyImpactAnalysis(input: { owner: string; re
 export async function requestProposedFix(input: { owner: string; repository: string; dependencyName: string; dependencyType: string; analysis: unknown; analysisTicket: string }): Promise<ProposedFixResult> {
   const user = await requireUser();
   const impactAnalysis = getImpactAnalysisSnapshot(input.analysis);
-  if (!impactAnalysis || !isValidGitHubRepository(input.owner, input.repository) || !isSafeDependencyName(input.dependencyName) || !dependencyTypes.has(input.dependencyType) || !verifyImpactAnalysisTicket(input.analysisTicket, { userId: user.id, owner: input.owner, repository: input.repository, dependencyName: input.dependencyName, dependencyType: input.dependencyType, analysis: impactAnalysis })) {
+  if (!impactAnalysis) {
+    logSafeProposedFixActionEvent("ticket_validation_failed", { category: "invalid_analysis_snapshot" });
+    return { kind: "error", error: "Generate a fresh AI impact analysis before requesting a proposed fix." };
+  }
+  if (!isValidGitHubRepository(input.owner, input.repository) || !isSafeDependencyName(input.dependencyName) || !dependencyTypes.has(input.dependencyType)) {
+    logSafeProposedFixActionEvent("ticket_validation_failed", { category: "invalid_request" });
+    return { kind: "error", error: "Generate a fresh AI impact analysis before requesting a proposed fix." };
+  }
+  if (!verifyImpactAnalysisTicket(input.analysisTicket, { userId: user.id, owner: input.owner, repository: input.repository, dependencyName: input.dependencyName, dependencyType: input.dependencyType, analysis: impactAnalysis })) {
+    logSafeProposedFixActionEvent("ticket_validation_failed", { category: "invalid_or_expired_ticket" });
     return { kind: "error", error: "Generate a fresh AI impact analysis before requesting a proposed fix." };
   }
 
-  const result = await getGitHubPackageJson(input.owner, input.repository);
-  if (result.kind !== "ready") return { kind: "error", error: "Repository dependency data is unavailable. Please reload and try again." };
+  const result = await getGitHubPackageJson(input.owner, input.repository).catch((error: unknown) => {
+    logSafeProposedFixActionEvent("context_gathering_failed", { category: "package_json_request_error" });
+    throw error;
+  });
+  if (result.kind !== "ready") {
+    logSafeProposedFixActionEvent("context_gathering_failed", { category: "package_json_unavailable" });
+    return { kind: "error", error: "Repository dependency data is unavailable. Please reload and try again." };
+  }
 
   const dependency = result.manifest.dependencies.find((item) => item.name === input.dependencyName && item.type === input.dependencyType);
   if (!dependency || dependency.status !== "update-available" || !dependency.latestVersion || !dependency.changeType || !dependency.risk) {
+    logSafeProposedFixActionEvent("pre_openai_failure", { category: "dependency_not_eligible" });
     return { kind: "error", error: "A proposed fix is available only for dependencies with an update available." };
   }
+  const latestVersion = dependency.latestVersion;
+  const changeType = dependency.changeType;
+  const risk = dependency.risk;
 
-  const [repositoryUsage, releaseInformation] = await Promise.all([
-    getRepositoryDependencyUsage(result.repository.owner, result.repository.name, dependency.name),
-    getReleaseInformation({ packageName: dependency.name, declaredVersionRange: dependency.version, latestVersion: dependency.latestVersion, changeType: dependency.changeType, latestPublishedAt: dependency.publishedAt }),
-  ]);
-  const fixContext = await getProposedFixContext(result.repository.owner, result.repository.name, dependency, repositoryUsage);
+  const proposedFixContext = await (async () => {
+    const [repositoryUsage, releaseInformation] = await Promise.all([
+      getRepositoryDependencyUsage(result.repository.owner, result.repository.name, dependency.name),
+      getReleaseInformation({ packageName: dependency.name, declaredVersionRange: dependency.version, latestVersion, changeType, latestPublishedAt: dependency.publishedAt }),
+    ]);
+    const fixContext = await getProposedFixContext(result.repository.owner, result.repository.name, dependency, repositoryUsage);
+    return { repositoryUsage, releaseInformation, fixContext };
+  })().catch((error: unknown) => {
+    logSafeProposedFixActionEvent("context_gathering_failed", { category: "unexpected_pre_openai_error" });
+    throw error;
+  });
 
   return generateProposedFix({
     repository: result.repository,
     dependency: {
       name: dependency.name,
       currentVersion: dependency.version,
-      latestVersion: dependency.latestVersion,
-      changeType: dependency.changeType,
-      risk: dependency.risk,
+      latestVersion,
+      changeType,
+      risk,
       dependencyType: dependency.type,
     },
     impactAnalysis,
-    repositoryUsage,
-    releaseInformation,
-    fixContext,
+    repositoryUsage: proposedFixContext.repositoryUsage,
+    releaseInformation: proposedFixContext.releaseInformation,
+    fixContext: proposedFixContext.fixContext,
   });
 }
 
@@ -162,4 +187,8 @@ function getFailureCategory(error: unknown) {
 
 function logSafeAiActionEvent(event: string, details: Record<string, string>) {
   console.error("[sentinel:ai-analysis-action]", event, details);
+}
+
+function logSafeProposedFixActionEvent(event: string, details: Record<string, string>) {
+  console.error("[sentinel:proposed-fix-action]", event, details);
 }
