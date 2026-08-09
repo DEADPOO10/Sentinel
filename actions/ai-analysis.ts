@@ -4,10 +4,11 @@ import { requireUser } from "@/lib/auth/session";
 import { getRepositoryDependencyUsage, type RepositoryUsageContext } from "@/lib/github/dependency-usage";
 import { getGitHubPackageJson, isValidGitHubRepository } from "@/lib/github/package-json";
 import { analyzeDependencyImpact, type DependencyImpactAnalysis } from "@/lib/openai/impact-analysis";
+import { getReleaseInformation, type ReleaseInformationContext } from "@/lib/release-information";
 
 const dependencyTypes = new Set(["dependency", "devDependency", "peerDependency", "optionalDependency"]);
 
-export type DependencyImpactAnalysisActionResult = { analysis: DependencyImpactAnalysis & { risk: "low" | "medium" | "high"; repositoryUsage: RepositoryUsageContext } } | { error: string };
+export type DependencyImpactAnalysisActionResult = { analysis: DependencyImpactAnalysis & { risk: "low" | "medium" | "high"; repositoryUsage: RepositoryUsageContext; releaseInformation: ReleaseInformationContext } } | { error: string };
 
 export async function requestDependencyImpactAnalysis(input: { owner: string; repository: string; dependencyName: string; dependencyType: string }): Promise<DependencyImpactAnalysisActionResult> {
   await requireUser();
@@ -24,7 +25,16 @@ export async function requestDependencyImpactAnalysis(input: { owner: string; re
     return { error: "AI analysis is available only for dependencies with an update available." };
   }
 
-  const repositoryUsage = await getRepositoryDependencyUsage(result.repository.owner, result.repository.name, dependency.name);
+  const [repositoryUsage, releaseInformation] = await Promise.all([
+    getRepositoryDependencyUsage(result.repository.owner, result.repository.name, dependency.name),
+    getReleaseInformation({
+      packageName: dependency.name,
+      declaredVersionRange: dependency.version,
+      latestVersion: dependency.latestVersion,
+      changeType: dependency.changeType,
+      latestPublishedAt: dependency.publishedAt,
+    }),
+  ]);
   const analysisResult = await analyzeDependencyImpact({
     repository: {
       owner: result.repository.owner,
@@ -42,10 +52,11 @@ export async function requestDependencyImpactAnalysis(input: { owner: string; re
       dependencyType: dependency.type,
     },
     repositoryUsage,
+    releaseInformation,
   });
 
   if ("error" in analysisResult) return analysisResult;
-  return { analysis: { ...analysisResult.analysis, risk: dependency.risk, repositoryUsage } };
+  return { analysis: { ...analysisResult.analysis, risk: dependency.risk, repositoryUsage, releaseInformation } };
 }
 
 function isSafeDependencyName(value: string) {
