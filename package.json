@@ -18,13 +18,15 @@
     "react": "19.1.1",
     "react-dom": "19.1.1",
     "semver": "^7.8.5",
-    "tailwind-merge": "^3.3.0"
+    "tailwind-merge": "^3.3.0",
+    "yauzl": "^3.4.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.12",
     "@types/node": "^22.15.3",
     "@types/react": "^19.1.1",
     "@types/react-dom": "^19.1.1",
+    "@types/yauzl": "^3.4.0",
     "eslint": "^9.28.0",
     "eslint-config-next": "^15.5.22",
     "tailwindcss": "^4.1.12",

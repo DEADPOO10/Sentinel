@@ -4,10 +4,11 @@ import { requireUser } from "@/lib/auth/session";
 import { getRepositoryDependencyUsage, type RepositoryUsageContext } from "@/lib/github/dependency-usage";
 import { getProposedFixContext } from "@/lib/github/proposed-fix-context";
 import { getGitHubPackageJson, isValidGitHubRepository } from "@/lib/github/package-json";
-import { createImpactAnalysisTicket, getImpactAnalysisSnapshot, verifyImpactAnalysisTicket } from "@/lib/impact-analysis-ticket";
-import { generateProposedFix, type ProposedFixResult } from "@/lib/openai/proposed-fix";
+import { createImpactAnalysisTicket, createProposedFixValidationTicket, getImpactAnalysisSnapshot, getProposedFixValidationSnapshot, verifyImpactAnalysisTicket, verifyProposedFixValidationTicket } from "@/lib/impact-analysis-ticket";
+import { generateProposedFix, isProposedFixVerifiedForValidation, type ProposedFixResult } from "@/lib/openai/proposed-fix";
 import { analyzeDependencyImpact, type DependencyImpactAnalysis } from "@/lib/openai/impact-analysis";
 import { getReleaseInformation, type ReleaseInformationContext } from "@/lib/release-information";
+import { createUnableToValidateResult, validateProposedFixInTemporaryWorkspace, type ProposedFixValidationResult } from "@/lib/validation/proposed-fix-validation";
 
 const dependencyTypes = new Set(["dependency", "devDependency", "peerDependency", "optionalDependency"]);
 
@@ -132,7 +133,7 @@ export async function requestProposedFix(input: { owner: string; repository: str
     throw error;
   });
 
-  return generateProposedFix({
+  const proposedFixResult = await generateProposedFix({
     repository: result.repository,
     dependency: {
       name: dependency.name,
@@ -147,10 +148,146 @@ export async function requestProposedFix(input: { owner: string; repository: str
     releaseInformation: proposedFixContext.releaseInformation,
     fixContext: proposedFixContext.fixContext,
   });
+
+  if (proposedFixResult.kind !== "proposal") return proposedFixResult;
+
+  const validationTicket = createProposedFixValidationTicket({
+    userId: user.id,
+    owner: result.repository.owner,
+    repository: result.repository.name,
+    dependencyName: dependency.name,
+    dependencyType: dependency.type,
+    proposedFix: proposedFixResult.proposal,
+  });
+  if (!validationTicket) {
+    logSafeProposedFixActionEvent("validation_ticket_unavailable", { category: "missing_ticket_secret" });
+    return proposedFixResult;
+  }
+
+  return { ...proposedFixResult, validationTicket };
+}
+
+export async function requestProposedFixValidation(input: unknown): Promise<ProposedFixValidationResult> {
+  const user = await requireUser();
+  if (!isProposedFixValidationRequest(input)) {
+    logSafeProposedFixActionEvent("validation_preflight_failed", { category: "invalid_request" });
+    return createUnableToValidateResult("A fresh proposed fix is required before validation can run.");
+  }
+
+  const impactAnalysis = getImpactAnalysisSnapshot(input.analysis);
+  const proposedFix = getProposedFixValidationSnapshot(input.proposal);
+  if (!impactAnalysis || !proposedFix) {
+    logSafeProposedFixActionEvent("validation_preflight_failed", { category: "invalid_client_snapshot" });
+    return createUnableToValidateResult("A fresh proposed fix is required before validation can run.");
+  }
+  if (!isValidGitHubRepository(input.owner, input.repository) || !isSafeDependencyName(input.dependencyName) || !dependencyTypes.has(input.dependencyType)) {
+    logSafeProposedFixActionEvent("validation_preflight_failed", { category: "invalid_repository_or_dependency" });
+    return createUnableToValidateResult("This proposed fix cannot be validated.");
+  }
+  if (!verifyImpactAnalysisTicket(input.analysisTicket, {
+    userId: user.id,
+    owner: input.owner,
+    repository: input.repository,
+    dependencyName: input.dependencyName,
+    dependencyType: input.dependencyType,
+    analysis: impactAnalysis,
+  })) {
+    logSafeProposedFixActionEvent("validation_preflight_failed", { category: "invalid_or_expired_analysis_ticket" });
+    return createUnableToValidateResult("Generate a fresh AI impact analysis before validating this proposal.");
+  }
+  if (!verifyProposedFixValidationTicket(input.proposedFixTicket, {
+    userId: user.id,
+    owner: input.owner,
+    repository: input.repository,
+    dependencyName: input.dependencyName,
+    dependencyType: input.dependencyType,
+    proposedFix,
+  })) {
+    logSafeProposedFixActionEvent("validation_preflight_failed", { category: "invalid_or_expired_proposed_fix_ticket" });
+    return createUnableToValidateResult("Generate a fresh proposed fix before validation can run.");
+  }
+
+  let packageJsonResult;
+  try {
+    packageJsonResult = await getGitHubPackageJson(input.owner, input.repository);
+  } catch {
+    logSafeProposedFixActionEvent("validation_preflight_failed", { category: "repository_access_request_failed" });
+    return createUnableToValidateResult("Repository access could not be revalidated for this proposal.");
+  }
+  if (packageJsonResult.kind !== "ready") {
+    logSafeProposedFixActionEvent("validation_preflight_failed", { category: "repository_dependency_data_unavailable" });
+    return createUnableToValidateResult("Repository dependency data could not be revalidated for this proposal.");
+  }
+
+  const dependency = packageJsonResult.manifest.dependencies.find((item) => item.name === input.dependencyName && item.type === input.dependencyType);
+  if (!dependency || dependency.status !== "update-available" || !dependency.latestVersion || !dependency.changeType || !dependency.risk) {
+    logSafeProposedFixActionEvent("validation_preflight_failed", { category: "dependency_not_eligible" });
+    return createUnableToValidateResult("This dependency no longer has a validated update available.");
+  }
+
+  let repositoryUsage: RepositoryUsageContext;
+  try {
+    repositoryUsage = await getRepositoryDependencyUsage(packageJsonResult.repository.owner, packageJsonResult.repository.name, dependency.name);
+  } catch {
+    repositoryUsage = getUnavailableRepositoryUsageContext();
+    logSafeProposedFixActionEvent("validation_context_unavailable", { category: "repository_usage" });
+  }
+
+  let fixContext;
+  try {
+    fixContext = await getProposedFixContext(packageJsonResult.repository.owner, packageJsonResult.repository.name, dependency, repositoryUsage);
+  } catch {
+    logSafeProposedFixActionEvent("validation_preflight_failed", { category: "verified_context_request_failed" });
+    return createUnableToValidateResult("Verified repository context could not be prepared for this proposal.");
+  }
+
+  const dependencyForValidation = {
+    name: dependency.name,
+    currentVersion: dependency.version,
+    latestVersion: dependency.latestVersion,
+    changeType: dependency.changeType,
+    risk: dependency.risk,
+    dependencyType: dependency.type,
+  };
+  if (!isProposedFixVerifiedForValidation({ proposal: proposedFix, dependency: dependencyForValidation, fixContext })) {
+    logSafeProposedFixActionEvent("validation_preflight_failed", { category: "proposed_changes_not_verified" });
+    return createUnableToValidateResult("Sentinel could not verify the proposed changes against the current repository context.");
+  }
+
+  return validateProposedFixInTemporaryWorkspace({
+    owner: packageJsonResult.repository.owner,
+    repository: packageJsonResult.repository.name,
+    defaultBranch: packageJsonResult.repository.defaultBranch,
+    dependencyType: dependency.type,
+    proposedFix,
+  });
 }
 
 function isSafeDependencyName(value: string) {
   return value.length > 0 && value.length <= 214 && /^[a-zA-Z0-9@._/-]+$/.test(value);
+}
+
+function isProposedFixValidationRequest(value: unknown): value is {
+  owner: string;
+  repository: string;
+  dependencyName: string;
+  dependencyType: string;
+  analysis: unknown;
+  analysisTicket: string;
+  proposal: unknown;
+  proposedFixTicket: string;
+} {
+  return isRecord(value)
+    && typeof value.owner === "string"
+    && typeof value.repository === "string"
+    && typeof value.dependencyName === "string"
+    && typeof value.dependencyType === "string"
+    && typeof value.analysisTicket === "string"
+    && typeof value.proposedFixTicket === "string";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function getUnavailableRepositoryUsageContext(): RepositoryUsageContext {

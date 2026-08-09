@@ -54,7 +54,7 @@ export type ProposedFix = {
 };
 
 export type ProposedFixResult =
-  | { kind: "proposal"; proposal: ProposedFix }
+  | { kind: "proposal"; proposal: ProposedFix; validationTicket?: string }
   | {
     kind: "insufficient-context";
     status: "insufficient_context";
@@ -64,6 +64,28 @@ export type ProposedFixResult =
     suggestedNextStep: string;
   }
   | { kind: "error"; error: string };
+
+export function isProposedFixVerifiedForValidation(input: {
+  proposal: ProposedFix;
+  dependency: ProposedFixInput["dependency"];
+  fixContext: ProposedFixContext;
+}) {
+  const { proposal, dependency, fixContext } = input;
+  if (fixContext.status !== "ready" || !isSafeText(proposal.title, 160) || !isSafeText(proposal.summary, 1_000) || !isFiniteNumber(proposal.confidence)) return false;
+  if (!isValidPackageJsonChange(proposal.packageJsonChange) || proposal.packageJsonChange.dependency !== dependency.name || proposal.packageJsonChange.from !== dependency.currentVersion || proposal.packageJsonChange.to !== dependency.latestVersion) return false;
+
+  const parsedFiles = parseProposedFiles(proposal.files, fixContext);
+  if ("category" in parsedFiles) return false;
+  const validationSteps = parseTextList(proposal.validationSteps, PROPOSED_FIX_LIMITS.maxValidationSteps, 400);
+  const warnings = parseTextList(proposal.warnings, PROPOSED_FIX_LIMITS.maxWarnings, 400);
+  if (!validationSteps || !warnings || !doesNotMakeProhibitedClaim([proposal.title, proposal.summary, ...validationSteps, ...warnings])) return false;
+
+  if (proposal.files.length === 0) {
+    return proposal.packageJsonChange.required && canSafelyProposePackageJsonOnly(dependency, fixContext);
+  }
+
+  return true;
+}
 
 const proposalSchema = {
   type: "object",
@@ -186,7 +208,7 @@ export async function generateProposedFix(input: ProposedFixInput): Promise<Prop
       logSafeFixEvent("insufficient_context", { category: "no_verified_source_fix" });
       return createInsufficientContextResult(input, proposal.summary);
     }
-    if (proposal.files.length === 0 && !canSafelyProposePackageJsonOnly(input)) {
+    if (proposal.files.length === 0 && !canSafelyProposePackageJsonOnly(input.dependency, input.fixContext)) {
       logSafeFixEvent("insufficient_context", { category: "package_json_update_not_verified" });
       return createInsufficientContextResult(input, "Sentinel could not verify the package.json dependency context required for a safe version-bump proposal.");
     }
@@ -343,16 +365,16 @@ function createInsufficientContextResult(input: ProposedFixInput, reason: string
   };
 }
 
-function canSafelyProposePackageJsonOnly(input: ProposedFixInput) {
-  const section = getDependencySection(input.dependency.dependencyType);
-  const packageJsonContext = input.fixContext.files.find((file) => file.path === "package.json");
-  if (!section || !packageJsonContext || !input.dependency.name || !input.dependency.currentVersion || !input.dependency.latestVersion) return false;
+function canSafelyProposePackageJsonOnly(dependency: ProposedFixInput["dependency"], fixContext: ProposedFixContext) {
+  const section = getDependencySection(dependency.dependencyType);
+  const packageJsonContext = fixContext.files.find((file) => file.path === "package.json");
+  if (!section || !packageJsonContext || !dependency.name || !dependency.currentVersion || !dependency.latestVersion) return false;
 
   try {
     const parsed: unknown = JSON.parse(packageJsonContext.content);
     return isRecord(parsed)
       && isRecord(parsed[section])
-      && parsed[section][input.dependency.name] === input.dependency.currentVersion;
+      && parsed[section][dependency.name] === dependency.currentVersion;
   } catch {
     return false;
   }
