@@ -14,6 +14,7 @@ export const REPOSITORY_USAGE_LIMITS = {
   maxMatchingFiles: 8,
   maxSnippetCharacters: 400,
   maxContextCharacters: 3_200,
+  externalRequestTimeoutMs: 8_000,
 } as const;
 
 export type RepositoryDependencyUsage = {
@@ -31,20 +32,36 @@ export type RepositoryUsageContext = {
 
 type RepositoryDetails = { defaultBranch: string };
 type CodeSearchResult = { path: string };
+type RepositoryUsageFailureStage = "github_token" | "repository_access" | "code_search" | "response_parse" | "unknown";
+
+class RepositoryUsageError extends Error {
+  constructor(readonly stage: RepositoryUsageFailureStage, readonly httpStatus: number | null = null) {
+    super(stage);
+  }
+}
 
 export async function getRepositoryDependencyUsage(owner: string, repository: string, dependencyName: string): Promise<RepositoryUsageContext> {
   if (!isValidGitHubRepository(owner, repository) || !isSafeDependencyName(dependencyName)) return unavailableUsageContext();
 
-  const accessToken = await getGitHubAccessTokenForCurrentUser();
-  if (!accessToken) return unavailableUsageContext();
-
   try {
+    const accessToken = await getGitHubAccessTokenForCurrentUser();
+    if (!accessToken) {
+      logSafeUsageEvent("context_unavailable", { stage: "github_token" });
+      return unavailableUsageContext();
+    }
+
     // This request revalidates access before code search or file reads.
     const repositoryResponse = await fetchGitHubApi(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}`, accessToken);
-    if (!repositoryResponse.ok) return unavailableUsageContext();
+    if (!repositoryResponse.ok) {
+      logSafeUsageEvent("context_unavailable", { stage: "repository_access", httpStatus: repositoryResponse.status, httpCategory: getHttpStatusCategory(repositoryResponse.status) });
+      return unavailableUsageContext();
+    }
 
     const repositoryDetails = parseRepositoryDetails(await repositoryResponse.json());
-    if (!repositoryDetails) return unavailableUsageContext();
+    if (!repositoryDetails) {
+      logSafeUsageEvent("context_unavailable", { stage: "response_parse" });
+      return unavailableUsageContext();
+    }
 
     const candidatePaths = await findCandidateSourceFiles(owner, repository, dependencyName, accessToken);
     const inspectedFiles = await inspectCandidateFiles(candidatePaths, owner, repository, repositoryDetails.defaultBranch, dependencyName, accessToken);
@@ -56,7 +73,16 @@ export async function getRepositoryDependencyUsage(owner: string, repository: st
       matchingFiles: usages.length,
       usages,
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof RepositoryUsageError) {
+      logSafeUsageEvent("context_unavailable", {
+        stage: error.stage,
+        httpStatus: error.httpStatus,
+        httpCategory: error.httpStatus === null ? null : getHttpStatusCategory(error.httpStatus),
+      });
+    } else {
+      logSafeUsageEvent("context_unavailable", { stage: "unknown", category: getRequestFailureCategory(error) });
+    }
     return unavailableUsageContext();
   }
 }
@@ -69,11 +95,12 @@ async function findCandidateSourceFiles(owner: string, repository: string, depen
   const response = await fetch(searchUrl, {
     headers: githubHeaders(accessToken),
     cache: "no-store",
+    signal: AbortSignal.timeout(REPOSITORY_USAGE_LIMITS.externalRequestTimeoutMs),
   });
-  if (!response.ok) throw new Error("GitHub code search request failed");
+  if (!response.ok) throw new RepositoryUsageError("code_search", response.status);
 
   const body: unknown = await response.json();
-  if (!isRecord(body) || !Array.isArray(body.items)) throw new Error("GitHub code search response was invalid");
+  if (!isRecord(body) || !Array.isArray(body.items)) throw new RepositoryUsageError("response_parse");
 
   const paths = new Set<string>();
   for (const item of body.items) {
@@ -173,6 +200,7 @@ async function fetchGitHubApi(path: string, accessToken: string) {
   return fetch(new URL(path, GITHUB_API_ORIGIN), {
     headers: githubHeaders(accessToken),
     cache: "no-store",
+    signal: AbortSignal.timeout(REPOSITORY_USAGE_LIMITS.externalRequestTimeoutMs),
   });
 }
 
@@ -218,6 +246,22 @@ function escapeRegularExpression(value: string) {
 
 function unavailableUsageContext(): RepositoryUsageContext {
   return { inspectionStatus: "unavailable", filesInspected: 0, matchingFiles: 0, usages: [] };
+}
+
+function getHttpStatusCategory(status: number) {
+  if (status === 429) return "rate_limited";
+  if (status >= 500) return "server_error";
+  if (status >= 400) return "client_error";
+  return "unexpected_http_status";
+}
+
+function getRequestFailureCategory(error: unknown) {
+  if (error instanceof DOMException && (error.name === "TimeoutError" || error.name === "AbortError")) return "timeout";
+  return "network_or_response_error";
+}
+
+function logSafeUsageEvent(event: string, details: Record<string, string | number | null>) {
+  console.error("[sentinel:repository-usage]", event, details);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

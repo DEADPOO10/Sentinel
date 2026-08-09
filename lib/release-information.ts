@@ -63,20 +63,31 @@ export async function getReleaseInformation(input: ReleaseInformationInput): Pro
   const unavailable = createUnavailableContext(input, baseVersion);
   if (!baseVersion || !semver.valid(input.latestVersion) || semver.prerelease(input.latestVersion)) return unavailable;
 
-  const npmMetadata = await getNpmMetadata(input, baseVersion);
-  if (!npmMetadata) return unavailable;
+  try {
+    const npmMetadata = await getNpmMetadata(input, baseVersion);
+    if (!npmMetadata) return unavailable;
 
-  const githubToken = await getGitHubAccessTokenForCurrentUser();
-  if (githubToken && npmMetadata.repository) {
-    const githubReleaseEvidence = await getGitHubReleaseEvidence(npmMetadata.repository, baseVersion, input.latestVersion, githubToken);
-    if (githubReleaseEvidence.some((release) => release.excerpt)) return createAvailableContext(input, baseVersion, "github-releases", githubReleaseEvidence);
+    let githubToken: string | null = null;
+    try {
+      githubToken = await getGitHubAccessTokenForCurrentUser();
+    } catch (error) {
+      logSafeReleaseEvent("release_context_unavailable", { stage: "github_token", category: getFailureCategory(error) });
+    }
 
-    const changelogEvidence = await getChangelogEvidence(npmMetadata.repository, baseVersion, input.latestVersion, githubToken);
-    if (changelogEvidence.length > 0) return createAvailableContext(input, baseVersion, "changelog", changelogEvidence);
-    if (githubReleaseEvidence.length > 0) return createAvailableContext(input, baseVersion, "github-releases", githubReleaseEvidence);
+    if (githubToken && npmMetadata.repository) {
+      const githubReleaseEvidence = await getGitHubReleaseEvidence(npmMetadata.repository, baseVersion, input.latestVersion, githubToken);
+      if (githubReleaseEvidence.some((release) => release.excerpt)) return createAvailableContext(input, baseVersion, "github-releases", githubReleaseEvidence);
+
+      const changelogEvidence = await getChangelogEvidence(npmMetadata.repository, baseVersion, input.latestVersion, githubToken);
+      if (changelogEvidence.length > 0) return createAvailableContext(input, baseVersion, "changelog", changelogEvidence);
+      if (githubReleaseEvidence.length > 0) return createAvailableContext(input, baseVersion, "github-releases", githubReleaseEvidence);
+    }
+
+    return npmMetadata.releases.length > 0 ? createAvailableContext(input, baseVersion, "npm-metadata", npmMetadata.releases) : unavailable;
+  } catch (error) {
+    logSafeReleaseEvent("release_context_unavailable", { stage: "release_information", category: getFailureCategory(error) });
+    return unavailable;
   }
-
-  return npmMetadata.releases.length > 0 ? createAvailableContext(input, baseVersion, "npm-metadata", npmMetadata.releases) : unavailable;
 }
 
 async function getNpmMetadata(input: ReleaseInformationInput, baseVersion: string): Promise<NpmMetadata | null> {
@@ -86,16 +97,23 @@ async function getNpmMetadata(input: ReleaseInformationInput, baseVersion: strin
       cache: "no-store",
       signal: AbortSignal.timeout(RELEASE_INFORMATION_LIMITS.externalRequestTimeoutMs),
     });
-    if (!response.ok) return null;
+    if (!response.ok) {
+      logSafeReleaseEvent("release_context_unavailable", { stage: "npm_metadata", httpStatus: response.status, httpCategory: getHttpStatusCategory(response.status) });
+      return null;
+    }
 
     const metadata = parseJson(await readBoundedText(response, RELEASE_INFORMATION_LIMITS.maxNpmMetadataBytes));
-    if (!isRecord(metadata)) return null;
+    if (!isRecord(metadata)) {
+      logSafeReleaseEvent("release_context_unavailable", { stage: "npm_metadata_parse" });
+      return null;
+    }
 
     return {
       repository: getGitHubRepositoryReference(metadata.repository),
       releases: getNpmReleaseEvidence(metadata, baseVersion, input.latestVersion),
     };
-  } catch {
+  } catch (error) {
+    logSafeReleaseEvent("release_context_unavailable", { stage: "npm_metadata", category: getFailureCategory(error) });
     return null;
   }
 }
@@ -127,13 +145,20 @@ async function getGitHubReleaseEvidence(source: GitHubRepositoryReference, baseV
       cache: "no-store",
       signal: AbortSignal.timeout(RELEASE_INFORMATION_LIMITS.externalRequestTimeoutMs),
     });
-    if (!response.ok) return [];
+    if (!response.ok) {
+      logSafeReleaseEvent("release_context_unavailable", { stage: "github_releases", httpStatus: response.status, httpCategory: getHttpStatusCategory(response.status) });
+      return [];
+    }
 
     const body = parseJson(await readBoundedText(response, RELEASE_INFORMATION_LIMITS.maxGitHubReleaseResponseBytes));
-    if (!Array.isArray(body)) return [];
+    if (!Array.isArray(body)) {
+      logSafeReleaseEvent("release_context_unavailable", { stage: "github_releases_parse" });
+      return [];
+    }
 
     return limitEvidence(body.flatMap((release) => parseGitHubRelease(release, baseVersion, latestVersion)));
-  } catch {
+  } catch (error) {
+    logSafeReleaseEvent("release_context_unavailable", { stage: "github_releases", category: getFailureCategory(error) });
     return [];
   }
 }
@@ -162,10 +187,14 @@ async function getChangelogEvidence(source: GitHubRepositoryReference, baseVersi
     try {
       const response = await fetchChangelogRange(source, defaultBranch, path, accessToken);
       if (response.status === 404) continue;
-      if (!response.ok) return [];
+      if (!response.ok) {
+        logSafeReleaseEvent("release_context_unavailable", { stage: "changelog", httpStatus: response.status, httpCategory: getHttpStatusCategory(response.status) });
+        return [];
+      }
 
       return limitEvidence(extractChangelogEvidence(await readBoundedText(response, RELEASE_INFORMATION_LIMITS.maxChangelogBytesFetched), baseVersion, latestVersion));
-    } catch {
+    } catch (error) {
+      logSafeReleaseEvent("release_context_unavailable", { stage: "changelog", category: getFailureCategory(error) });
       return [];
     }
   }
@@ -303,10 +332,18 @@ async function getDefaultBranch(source: GitHubRepositoryReference, accessToken: 
       cache: "no-store",
       signal: AbortSignal.timeout(RELEASE_INFORMATION_LIMITS.externalRequestTimeoutMs),
     });
-    if (!response.ok) return null;
+    if (!response.ok) {
+      logSafeReleaseEvent("release_context_unavailable", { stage: "github_default_branch", httpStatus: response.status, httpCategory: getHttpStatusCategory(response.status) });
+      return null;
+    }
     const body = parseJson(await readBoundedText(response, 20_000));
-    return isRecord(body) && typeof body.default_branch === "string" ? body.default_branch : null;
-  } catch {
+    if (!isRecord(body) || typeof body.default_branch !== "string") {
+      logSafeReleaseEvent("release_context_unavailable", { stage: "github_default_branch_parse" });
+      return null;
+    }
+    return body.default_branch;
+  } catch (error) {
+    logSafeReleaseEvent("release_context_unavailable", { stage: "github_default_branch", category: getFailureCategory(error) });
     return null;
   }
 }
@@ -368,6 +405,22 @@ function parseJson(value: string): unknown {
 
 function isValidDate(value: string) {
   return Number.isFinite(Date.parse(value));
+}
+
+function getHttpStatusCategory(status: number) {
+  if (status === 429) return "rate_limited";
+  if (status >= 500) return "server_error";
+  if (status >= 400) return "client_error";
+  return "unexpected_http_status";
+}
+
+function getFailureCategory(error: unknown) {
+  if (error instanceof DOMException && (error.name === "TimeoutError" || error.name === "AbortError")) return "timeout";
+  return "network_or_response_error";
+}
+
+function logSafeReleaseEvent(event: string, details: Record<string, string | number | null>) {
+  console.error("[sentinel:release-information]", event, details);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
