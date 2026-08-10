@@ -2,6 +2,7 @@
 
 import { requireUser } from "@/lib/auth/session";
 import { persistImpactAnalysisForFinding } from "@/lib/db/impact-analyses";
+import { persistPullRequestForProposedFix } from "@/lib/db/pull-requests";
 import { persistProposedFixForFinding } from "@/lib/db/proposed-fixes";
 import { persistValidationRun } from "@/lib/db/validation-runs";
 import { getRepositoryDependencyUsage, type RepositoryUsageContext } from "@/lib/github/dependency-usage";
@@ -416,6 +417,7 @@ export async function requestDraftPullRequest(input: unknown): Promise<DraftPull
     logSafePrActionEvent("creation_preflight_failed", { category: "dependency_changed" });
     return { kind: "error", error: "This dependency no longer has the expected update. Run analysis and validation again." };
   }
+  const latestDependencyVersion = dependency.latestVersion;
 
   const repositoryBase = await getGitHubRepositoryBaseForCurrentUser(input.owner, input.repository, true);
   if (repositoryBase.kind !== "ready") {
@@ -446,7 +448,40 @@ export async function requestDraftPullRequest(input: unknown): Promise<DraftPull
     proposedChangeIdentifier: validationBinding.proposedChangeIdentifier,
   };
 
-  return runDraftPullRequestIdempotently(input.validationTicket, () => createDraftPullRequestFromVerifiedChanges(draftPullRequestInput));
+  return runDraftPullRequestIdempotently(input.validationTicket, async () => {
+    const pullRequestResult = await createDraftPullRequestFromVerifiedChanges(draftPullRequestInput);
+    if (pullRequestResult.kind === "error") return pullRequestResult;
+
+    try {
+      await persistPullRequestForProposedFix({
+        owner: repositoryBase.repository.owner,
+        repository: repositoryBase.repository.repository,
+        defaultBranch: validationBinding.defaultBranch,
+        githubRepositoryId: packageJsonResult.repository.githubRepositoryId,
+        baseCommitSha: validationBinding.baseCommitSha,
+        dependency: {
+          packageName: dependency.name,
+          dependencyType: dependency.type,
+          declaredVersion: dependency.version,
+          latestVersion: latestDependencyVersion,
+        },
+        proposal: proposedFix,
+        pullRequest: pullRequestResult,
+      });
+    } catch {
+      // A GitHub-confirmed PR remains successful even if its optional history write fails.
+      console.error("[sentinel:pr-persistence] persistence_failed", {
+        stage: "action_handoff",
+        errorName: "unexpected_error",
+        prismaCode: null,
+        model: null,
+        target: null,
+        category: "database_or_request_error",
+      });
+    }
+
+    return pullRequestResult;
+  });
 }
 
 function validationActionResult(validation: ProposedFixValidationResult, validationTicket?: string): ProposedFixValidationActionResult {
