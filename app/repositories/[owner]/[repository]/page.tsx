@@ -3,10 +3,12 @@ import Link from "next/link";
 import { ChevronRight, FileCode2, GitBranch } from "lucide-react";
 import { notFound } from "next/navigation";
 import { requireUser } from "@/lib/auth/session";
+import { listRecentMaintenanceActivityForRepository, type MaintenanceActivity } from "@/lib/db/maintenance-activity";
 import { createCompletedScanWithFindings } from "@/lib/db/scans";
 import { getGitHubPackageJson, isValidGitHubRepository, type GitHubPackageJsonResult } from "@/lib/github/package-json";
 import type { CheckedPackageManifest, DependencyStatus, ReleaseChangeType, ReleaseRisk } from "@/lib/npm/dependency-versions";
 import { DependencyAiAnalysis } from "@/components/repository/dependency-ai-analysis";
+import { MaintenanceActivitySection } from "@/components/maintenance-activity";
 import { SiteNavigation } from "@/components/site-navigation";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -24,20 +26,31 @@ export default async function RepositoryPackagePage({ params }: PageProps) {
   const scanStartedAt = new Date();
   const result = await getGitHubPackageJson(owner, repository);
   const scanPersistenceWarning = result.kind === "ready" ? await persistCompletedScan(result, scanStartedAt) : null;
+  const activity = "repository" in result
+    ? await getRepositoryActivity(result.repository.githubRepositoryId)
+    : [];
 
   if (result.kind === "not-found") notFound();
 
-  return <main className="min-h-screen bg-[#fffdf8] text-[#111827]"><SiteNavigation /><section className="mx-auto max-w-7xl px-6 py-10 lg:px-8 lg:py-14"><Breadcrumb owner={owner} repository={repository} />{"error" in result ? <RepositoryError message={result.error} /> : <RepositoryPackageContent result={result} scanPersistenceWarning={scanPersistenceWarning} />}</section></main>;
+  return <main className="min-h-screen bg-[#fffdf8] text-[#111827]"><SiteNavigation /><section className="mx-auto max-w-7xl px-6 py-10 lg:px-8 lg:py-14"><Breadcrumb owner={owner} repository={repository} />{"error" in result ? <RepositoryError message={result.error} /> : <RepositoryPackageContent result={result} scanPersistenceWarning={scanPersistenceWarning} activity={activity} />}</section></main>;
 }
 
 function Breadcrumb({ owner, repository }: { owner: string; repository: string }) {
   return <nav aria-label="Breadcrumb" className="mb-7 flex items-center gap-1.5 text-sm text-[#6b7280]"><Link href="/dashboard" className="transition-colors hover:text-[#92400e]">Dashboard</Link><ChevronRight className="h-3.5 w-3.5" /><Link href="/repositories" className="transition-colors hover:text-[#92400e]">Repositories</Link><ChevronRight className="h-3.5 w-3.5" /><span className="truncate text-[#4b5563]">{owner}/{repository}</span></nav>;
 }
 
-function RepositoryPackageContent({ result, scanPersistenceWarning }: { result: Exclude<GitHubPackageJsonResult, { kind: "not-found" } | { kind: "error" }>; scanPersistenceWarning: string | null }) {
+function RepositoryPackageContent({ result, scanPersistenceWarning, activity }: { result: Exclude<GitHubPackageJsonResult, { kind: "not-found" } | { kind: "error" }>; scanPersistenceWarning: string | null; activity: MaintenanceActivity[] }) {
   const { repository } = result;
 
-  return <><div className="flex flex-col justify-between gap-6 border-b border-[#f3e8d5] pb-8 sm:flex-row sm:items-end"><div className="flex min-w-0 items-center gap-3"><span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg border border-[#f3e8d5] bg-[#fef3c7] text-[#b45309]"><GitBranch className="h-5 w-5" /></span><div className="min-w-0"><p className="truncate font-mono text-sm text-[#6b7280]">{repository.owner}/{repository.name}</p><h1 className="truncate text-3xl font-medium tracking-[-.04em] sm:text-4xl">{repository.name}</h1></div></div><span className="inline-flex items-center gap-1.5 text-sm text-[#6b7280]"><GitBranch className="h-4 w-4" />{repository.defaultBranch}</span></div>{scanPersistenceWarning ? <p className="mt-5 rounded-lg border border-[#f3e8d5] bg-[#fffaf0] px-4 py-3 text-sm text-[#92400e]" role="status">{scanPersistenceWarning}</p> : null}{result.kind === "ready" ? <PackageManifestContent manifest={result.manifest} owner={repository.owner} repository={repository.name} /> : <NoPackageJsonState invalid={result.kind === "invalid-package-json"} />}</>;
+  return <><div className="flex flex-col justify-between gap-6 border-b border-[#f3e8d5] pb-8 sm:flex-row sm:items-end"><div className="flex min-w-0 items-center gap-3"><span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg border border-[#f3e8d5] bg-[#fef3c7] text-[#b45309]"><GitBranch className="h-5 w-5" /></span><div className="min-w-0"><p className="truncate font-mono text-sm text-[#6b7280]">{repository.owner}/{repository.name}</p><h1 className="truncate text-3xl font-medium tracking-[-.04em] sm:text-4xl">{repository.name}</h1></div></div><span className="inline-flex items-center gap-1.5 text-sm text-[#6b7280]"><GitBranch className="h-4 w-4" />{repository.defaultBranch}</span></div>{scanPersistenceWarning ? <p className="mt-5 rounded-lg border border-[#f3e8d5] bg-[#fffaf0] px-4 py-3 text-sm text-[#92400e]" role="status">{scanPersistenceWarning}</p> : null}{result.kind === "ready" ? <PackageManifestContent manifest={result.manifest} owner={repository.owner} repository={repository.name} /> : <NoPackageJsonState invalid={result.kind === "invalid-package-json"} />}<div className="mt-8"><MaintenanceActivitySection title="Recent Sentinel activity" description="Persisted scans, analysis, fixes, validation, and draft PRs for this repository." activities={activity} /></div></>;
+}
+
+async function getRepositoryActivity(githubRepositoryId: number): Promise<MaintenanceActivity[]> {
+  try {
+    return await listRecentMaintenanceActivityForRepository(githubRepositoryId);
+  } catch {
+    return [];
+  }
 }
 
 async function persistCompletedScan(result: Extract<GitHubPackageJsonResult, { kind: "ready" }>, startedAt: Date) {
