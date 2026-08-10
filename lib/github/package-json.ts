@@ -6,9 +6,11 @@ const GITHUB_OWNER_PATTERN = /^[A-Za-z\d](?:[A-Za-z\d]|-(?=[A-Za-z\d])){0,38}$/;
 const GITHUB_REPOSITORY_PATTERN = /^[A-Za-z\d][A-Za-z\d._-]{0,99}$/;
 
 export type GitHubRepositoryDetails = {
+  githubRepositoryId: number;
   name: string;
   owner: string;
   defaultBranch: string;
+  baseCommitSha: string | null;
 };
 
 export type PackageDependency = {
@@ -58,7 +60,10 @@ export async function getGitHubPackageJson(owner: string, repository: string): P
     const repositoryDetails = parseRepositoryDetails(await repositoryResponse.json());
     if (!repositoryDetails) throw new GitHubApiError(repositoryResponse.status);
 
-    const packageJsonResponse = await fetchGitHubApi(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/contents/package.json?ref=${encodeURIComponent(repositoryDetails.defaultBranch)}`, accessToken);
+    const baseCommitSha = await getDefaultBranchCommitSha(owner, repository, repositoryDetails.defaultBranch, accessToken);
+    repositoryDetails.baseCommitSha = baseCommitSha;
+
+    const packageJsonResponse = await fetchGitHubApi(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/contents/package.json?ref=${encodeURIComponent(baseCommitSha ?? repositoryDetails.defaultBranch)}`, accessToken);
     if (packageJsonResponse.status === 404) return { kind: "no-package-json", repository: repositoryDetails };
     if (!packageJsonResponse.ok) throw new GitHubApiError(packageJsonResponse.status);
 
@@ -85,9 +90,23 @@ async function fetchGitHubApi(path: string, accessToken: string) {
 }
 
 function parseRepositoryDetails(value: unknown): GitHubRepositoryDetails | null {
-  if (!isRecord(value) || typeof value.name !== "string" || !isRecord(value.owner) || typeof value.owner.login !== "string" || typeof value.default_branch !== "string") return null;
+  if (!isRecord(value) || typeof value.id !== "number" || !Number.isSafeInteger(value.id) || value.id <= 0 || typeof value.name !== "string" || !isRecord(value.owner) || typeof value.owner.login !== "string" || typeof value.default_branch !== "string") return null;
 
-  return { name: value.name, owner: value.owner.login, defaultBranch: value.default_branch };
+  return { githubRepositoryId: value.id, name: value.name, owner: value.owner.login, defaultBranch: value.default_branch, baseCommitSha: null };
+}
+
+async function getDefaultBranchCommitSha(owner: string, repository: string, defaultBranch: string, accessToken: string) {
+  try {
+    const response = await fetchGitHubApi(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/git/ref/heads/${encodeURIComponent(defaultBranch)}`, accessToken);
+    if (!response.ok) return null;
+
+    const value: unknown = await response.json();
+    return isRecord(value) && isRecord(value.object) && value.object.type === "commit" && typeof value.object.sha === "string" && /^[a-f\d]{40,64}$/i.test(value.object.sha)
+      ? value.object.sha
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function parseContentResponse(value: unknown) {

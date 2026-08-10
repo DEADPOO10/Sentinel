@@ -120,6 +120,7 @@ model UserRepository {
 model Scan {
   id               String     @id @default(cuid())
   repositoryId     String
+  idempotencyKey   String?    @unique
   status           ScanStatus @default(PENDING)
   baseCommitSha    String?
   dependencyCount  Int        @default(0)
@@ -132,6 +133,7 @@ model Scan {
   findings         Finding[]
 
   @@index([repositoryId, createdAt])
+  @@index([repositoryId, status, completedAt])
   @@index([status, createdAt])
 }
 

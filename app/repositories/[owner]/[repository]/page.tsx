@@ -3,6 +3,7 @@ import Link from "next/link";
 import { ChevronRight, FileCode2, GitBranch } from "lucide-react";
 import { notFound } from "next/navigation";
 import { requireUser } from "@/lib/auth/session";
+import { createCompletedScanWithFindings } from "@/lib/db/scans";
 import { getGitHubPackageJson, isValidGitHubRepository, type GitHubPackageJsonResult } from "@/lib/github/package-json";
 import type { CheckedPackageManifest, DependencyStatus, ReleaseChangeType, ReleaseRisk } from "@/lib/npm/dependency-versions";
 import { DependencyAiAnalysis } from "@/components/repository/dependency-ai-analysis";
@@ -20,21 +21,48 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
 export default async function RepositoryPackagePage({ params }: PageProps) {
   await requireUser();
   const { owner, repository } = await params;
+  const scanStartedAt = new Date();
   const result = await getGitHubPackageJson(owner, repository);
+  const scanPersistenceWarning = result.kind === "ready" ? await persistCompletedScan(result, scanStartedAt) : null;
 
   if (result.kind === "not-found") notFound();
 
-  return <main className="min-h-screen bg-[#fffdf8] text-[#111827]"><SiteNavigation /><section className="mx-auto max-w-7xl px-6 py-10 lg:px-8 lg:py-14"><Breadcrumb owner={owner} repository={repository} />{"error" in result ? <RepositoryError message={result.error} /> : <RepositoryPackageContent result={result} />}</section></main>;
+  return <main className="min-h-screen bg-[#fffdf8] text-[#111827]"><SiteNavigation /><section className="mx-auto max-w-7xl px-6 py-10 lg:px-8 lg:py-14"><Breadcrumb owner={owner} repository={repository} />{"error" in result ? <RepositoryError message={result.error} /> : <RepositoryPackageContent result={result} scanPersistenceWarning={scanPersistenceWarning} />}</section></main>;
 }
 
 function Breadcrumb({ owner, repository }: { owner: string; repository: string }) {
   return <nav aria-label="Breadcrumb" className="mb-7 flex items-center gap-1.5 text-sm text-[#6b7280]"><Link href="/dashboard" className="transition-colors hover:text-[#92400e]">Dashboard</Link><ChevronRight className="h-3.5 w-3.5" /><Link href="/repositories" className="transition-colors hover:text-[#92400e]">Repositories</Link><ChevronRight className="h-3.5 w-3.5" /><span className="truncate text-[#4b5563]">{owner}/{repository}</span></nav>;
 }
 
-function RepositoryPackageContent({ result }: { result: Exclude<GitHubPackageJsonResult, { kind: "not-found" } | { kind: "error" }> }) {
+function RepositoryPackageContent({ result, scanPersistenceWarning }: { result: Exclude<GitHubPackageJsonResult, { kind: "not-found" } | { kind: "error" }>; scanPersistenceWarning: string | null }) {
   const { repository } = result;
 
-  return <><div className="flex flex-col justify-between gap-6 border-b border-[#f3e8d5] pb-8 sm:flex-row sm:items-end"><div className="flex min-w-0 items-center gap-3"><span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg border border-[#f3e8d5] bg-[#fef3c7] text-[#b45309]"><GitBranch className="h-5 w-5" /></span><div className="min-w-0"><p className="truncate font-mono text-sm text-[#6b7280]">{repository.owner}/{repository.name}</p><h1 className="truncate text-3xl font-medium tracking-[-.04em] sm:text-4xl">{repository.name}</h1></div></div><span className="inline-flex items-center gap-1.5 text-sm text-[#6b7280]"><GitBranch className="h-4 w-4" />{repository.defaultBranch}</span></div>{result.kind === "ready" ? <PackageManifestContent manifest={result.manifest} owner={repository.owner} repository={repository.name} /> : <NoPackageJsonState invalid={result.kind === "invalid-package-json"} />}</>;
+  return <><div className="flex flex-col justify-between gap-6 border-b border-[#f3e8d5] pb-8 sm:flex-row sm:items-end"><div className="flex min-w-0 items-center gap-3"><span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg border border-[#f3e8d5] bg-[#fef3c7] text-[#b45309]"><GitBranch className="h-5 w-5" /></span><div className="min-w-0"><p className="truncate font-mono text-sm text-[#6b7280]">{repository.owner}/{repository.name}</p><h1 className="truncate text-3xl font-medium tracking-[-.04em] sm:text-4xl">{repository.name}</h1></div></div><span className="inline-flex items-center gap-1.5 text-sm text-[#6b7280]"><GitBranch className="h-4 w-4" />{repository.defaultBranch}</span></div>{scanPersistenceWarning ? <p className="mt-5 rounded-lg border border-[#f3e8d5] bg-[#fffaf0] px-4 py-3 text-sm text-[#92400e]" role="status">{scanPersistenceWarning}</p> : null}{result.kind === "ready" ? <PackageManifestContent manifest={result.manifest} owner={repository.owner} repository={repository.name} /> : <NoPackageJsonState invalid={result.kind === "invalid-package-json"} />}</>;
+}
+
+async function persistCompletedScan(result: Extract<GitHubPackageJsonResult, { kind: "ready" }>, startedAt: Date) {
+  try {
+    const persisted = await createCompletedScanWithFindings({
+      githubRepositoryId: result.repository.githubRepositoryId,
+      baseCommitSha: result.repository.baseCommitSha,
+      startedAt,
+      completedAt: new Date(),
+      findings: result.manifest.dependencies,
+    });
+    if (persisted.kind === "created" || persisted.kind === "existing") return null;
+
+    logSafeScanPersistenceEvent("scan_not_persisted", { category: persisted.kind === "not-connected" ? "repository_not_connected" : "invalid_scan_data" });
+    return persisted.kind === "not-connected"
+      ? "Sentinel displayed the live dependency results, but could not save a scan snapshot because this repository is not connected to your workspace."
+      : "Sentinel displayed the live dependency results, but could not save this scan snapshot.";
+  } catch {
+    logSafeScanPersistenceEvent("persistence_call_boundary_failed", {});
+    return "Sentinel displayed the live dependency results, but could not save this scan snapshot.";
+  }
+}
+
+function logSafeScanPersistenceEvent(event: string, details: Record<string, string>) {
+  console.error("[sentinel:scan-persistence]", event, details);
 }
 
 function PackageManifestContent({ manifest, owner, repository }: { manifest: CheckedPackageManifest; owner: string; repository: string }) {
