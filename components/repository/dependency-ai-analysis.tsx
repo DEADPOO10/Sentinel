@@ -74,6 +74,7 @@ export function DependencyAiAnalysis({ owner, repository, dependencyName, depend
         analysisTicket: analysisResult.analysisTicket,
         proposal: proposedFixResult.proposal,
         proposedFixTicket: proposedFixResult.validationTicket,
+        validationAttemptId: crypto.randomUUID(),
       }));
     });
   }

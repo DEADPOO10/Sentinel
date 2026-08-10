@@ -9,8 +9,8 @@ const MAX_SNIPPET_CHARACTERS = 2_000;
 const MAX_TEXT_LIST_ITEMS = 8;
 const MAX_TEXT_LIST_ITEM_CHARACTERS = 400;
 
-type ProposedFixPersistenceStage = FindingResolutionStage | "proposed_fix_upsert";
-type ProposedFixPersistenceUnavailableCategory = "invalid_input" | "repository_not_connected" | "latest_scan_unavailable" | "latest_scan_mismatch" | "finding_not_found_or_changed" | "database_error";
+type ProposedFixPersistenceStage = FindingResolutionStage | "proposed_fix_resolution" | "proposed_fix_upsert";
+type ProposedFixPersistenceUnavailableCategory = "invalid_input" | "repository_not_connected" | "latest_scan_unavailable" | "latest_scan_mismatch" | "finding_not_found_or_changed" | "proposed_fix_not_found_or_changed" | "database_error";
 
 export type ProposedFixPersistenceInput = PersistedFindingIdentityInput & {
   proposal: ProposedFix;
@@ -19,6 +19,10 @@ export type ProposedFixPersistenceInput = PersistedFindingIdentityInput & {
 export type ProposedFixPersistenceResult =
   | { kind: "persisted"; findingId: string }
   | { kind: "unavailable"; category: ProposedFixPersistenceUnavailableCategory };
+
+export type PersistedProposedFixResolution =
+  | { kind: "resolved"; proposedFixId: string }
+  | { kind: "unavailable"; stage: ProposedFixPersistenceStage; category: ProposedFixPersistenceUnavailableCategory };
 
 export type SavedProposedFix = {
   status: "proposed" | "insufficient_context";
@@ -94,6 +98,45 @@ export async function persistProposedFixForFinding(input: ProposedFixPersistence
     logPersistenceFailure(stage, error);
     return { kind: "unavailable", category: "database_error" };
   }
+}
+
+/**
+ * Resolves the current persisted proposal only when it exactly matches the
+ * verified proposal supplied by the signed validation flow.
+ */
+export async function resolvePersistedProposedFixForValidation(input: ProposedFixPersistenceInput): Promise<PersistedProposedFixResolution> {
+  const data = getPersistenceData(input);
+  if (!data) return { kind: "unavailable", stage: "finding_resolution", category: "invalid_input" };
+
+  let stage: ProposedFixPersistenceStage = "membership_verification";
+  const githubUserId = await getCurrentGitHubUserId();
+  if (!githubUserId) return { kind: "unavailable", stage, category: "repository_not_connected" };
+
+  const client = getPrismaClient();
+  const finding = await resolveLatestFindingForCurrentUser(client, githubUserId, data.identity, (nextStage) => {
+    stage = nextStage;
+  });
+  if ("kind" in finding) return { kind: "unavailable", stage, category: finding.category };
+
+  stage = "proposed_fix_resolution";
+  const proposedFix = await client.proposedFix.findUnique({
+    where: { findingId: finding.findingId },
+    select: {
+      id: true,
+      status: true,
+      confidence: true,
+      summary: true,
+      packageJsonChangeJson: true,
+      sourceChangesJson: true,
+      validationStepsJson: true,
+      warningsJson: true,
+    },
+  });
+  if (!proposedFix || !matchesPersistedProposal(proposedFix, data.proposal)) {
+    return { kind: "unavailable", stage, category: "proposed_fix_not_found_or_changed" };
+  }
+
+  return { kind: "resolved", proposedFixId: proposedFix.id };
 }
 
 /** Reads a current proposal only after re-verifying user ownership and the latest matching finding. */
@@ -217,6 +260,36 @@ function getSavedPackageJsonChange(value: unknown): SavedProposedFix["packageJso
   const from = getSafeText(value.from, 256);
   const to = getSafeText(value.to, 64);
   return dependency && from && to ? { required: value.required, dependency, from, to } : null;
+}
+
+function matchesPersistedProposal(value: {
+  status: "PROPOSED" | "INSUFFICIENT_CONTEXT";
+  confidence: number | null;
+  summary: string;
+  packageJsonChangeJson: unknown;
+  sourceChangesJson: unknown;
+  validationStepsJson: unknown;
+  warningsJson: unknown;
+}, proposal: PersistenceData["proposal"]) {
+  return value.status === "PROPOSED"
+    && value.confidence === proposal.confidence
+    && value.summary === proposal.summary
+    && isSameJsonValue(value.packageJsonChangeJson, proposal.packageJsonChange)
+    && isSameJsonValue(value.sourceChangesJson, proposal.sourceChanges)
+    && isSameJsonValue(value.validationStepsJson, proposal.validationSteps)
+    && isSameJsonValue(value.warningsJson, proposal.warnings);
+}
+
+function isSameJsonValue(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((item, index) => isSameJsonValue(item, right[index]));
+  }
+  if (!isRecord(left) || !isRecord(right)) return false;
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key, index) => key === rightKeys[index] && isSameJsonValue(left[key], right[key]));
 }
 
 function getSafeSourceChanges(value: unknown): SavedProposedFix["sourceChanges"] | null {

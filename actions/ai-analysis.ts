@@ -3,6 +3,7 @@
 import { requireUser } from "@/lib/auth/session";
 import { persistImpactAnalysisForFinding } from "@/lib/db/impact-analyses";
 import { persistProposedFixForFinding } from "@/lib/db/proposed-fixes";
+import { persistValidationRun } from "@/lib/db/validation-runs";
 import { getRepositoryDependencyUsage, type RepositoryUsageContext } from "@/lib/github/dependency-usage";
 import { createDraftPullRequestFromVerifiedChanges, getGitHubRepositoryBaseForCurrentUser, type DraftPullRequestActionResult as GitHubDraftPullRequestActionResult } from "@/lib/github/draft-pull-request";
 import { getProposedFixContext } from "@/lib/github/proposed-fix-context";
@@ -14,6 +15,7 @@ import { getReleaseInformation, type ReleaseInformationContext } from "@/lib/rel
 import { createUnableToValidateResult, isProposedFixValidationEligibleForDraftPullRequest, validateProposedFixInTemporaryWorkspace, type ProposedFixValidationResult } from "@/lib/validation/proposed-fix-validation";
 
 const dependencyTypes = new Set(["dependency", "devDependency", "peerDependency", "optionalDependency"]);
+const validationRequests = new Map<string, Promise<ProposedFixValidationActionResult>>();
 
 export type DependencyImpactAnalysisActionResult = { analysis: DependencyImpactAnalysis & { risk: "low" | "medium" | "high"; repositoryUsage: RepositoryUsageContext; releaseInformation: ReleaseInformationContext }; analysisTicket: string } | { error: string };
 export type ProposedFixValidationActionResult = { validation: ProposedFixValidationResult; validationTicket?: string };
@@ -204,6 +206,10 @@ export async function requestProposedFixValidation(input: unknown): Promise<Prop
     return validationActionResult(createUnableToValidateResult("A fresh proposed fix is required before validation can run."));
   }
 
+  return runValidationIdempotently(`${user.id}:${input.validationAttemptId}`, () => requestProposedFixValidationForCurrentUser(input, user.id));
+}
+
+async function requestProposedFixValidationForCurrentUser(input: ProposedFixValidationRequest, userId: string): Promise<ProposedFixValidationActionResult> {
   const impactAnalysis = getImpactAnalysisSnapshot(input.analysis);
   const proposedFix = getProposedFixValidationSnapshot(input.proposal);
   if (!impactAnalysis || !proposedFix) {
@@ -215,7 +221,7 @@ export async function requestProposedFixValidation(input: unknown): Promise<Prop
     return validationActionResult(createUnableToValidateResult("This proposed fix cannot be validated."));
   }
   if (!verifyImpactAnalysisTicket(input.analysisTicket, {
-    userId: user.id,
+    userId,
     owner: input.owner,
     repository: input.repository,
     dependencyName: input.dependencyName,
@@ -226,7 +232,7 @@ export async function requestProposedFixValidation(input: unknown): Promise<Prop
     return validationActionResult(createUnableToValidateResult("Generate a fresh AI impact analysis before validating this proposal."));
   }
   if (!verifyProposedFixValidationTicket(input.proposedFixTicket, {
-    userId: user.id,
+    userId,
     owner: input.owner,
     repository: input.repository,
     dependencyName: input.dependencyName,
@@ -298,6 +304,19 @@ export async function requestProposedFixValidation(input: unknown): Promise<Prop
     dependencyType: dependency.type,
     proposedFix,
   });
+  await persistValidationRun({
+    githubRepositoryId: packageJsonResult.repository.githubRepositoryId,
+    baseCommitSha: repositoryBase.repository.baseCommitSha,
+    dependency: {
+      packageName: dependency.name,
+      dependencyType: dependency.type,
+      declaredVersion: dependency.version,
+      latestVersion: dependency.latestVersion,
+    },
+    proposal: proposedFix,
+    validation,
+    validationAttemptId: input.validationAttemptId,
+  });
   if (!isProposedFixValidationEligibleForDraftPullRequest(validation) || !isPullRequestCreationEnabled()) return validationActionResult(validation);
   if (validation.baseBranch !== repositoryBase.repository.defaultBranch || validation.baseCommitSha !== repositoryBase.repository.baseCommitSha) {
     logSafeProposedFixActionEvent("validation_ticket_unavailable", { category: "validation_base_binding_mismatch" });
@@ -305,7 +324,7 @@ export async function requestProposedFixValidation(input: unknown): Promise<Prop
   }
 
   const validationTicket = createCompletedValidationPrTicket({
-    userId: user.id,
+    userId,
     owner: repositoryBase.repository.owner,
     repository: repositoryBase.repository.repository,
     dependencyName: dependency.name,
@@ -495,6 +514,17 @@ function runDraftPullRequestIdempotently(ticket: string, create: () => Promise<D
   return request;
 }
 
+function runValidationIdempotently(key: string, validate: () => Promise<ProposedFixValidationActionResult>) {
+  const activeRequest = validationRequests.get(key);
+  if (activeRequest) return activeRequest;
+
+  const request = validate().finally(() => {
+    validationRequests.delete(key);
+  });
+  validationRequests.set(key, request);
+  return request;
+}
+
 function getRepositoryWritePreflightError(category: string) {
   if (category === "write_access" || category === "repository_restricted") return "GitHub write access could not be verified for this repository.";
   if (category === "github_authorization") return "GitHub authorization is unavailable. Reconnect GitHub and try again.";
@@ -520,7 +550,7 @@ function isSafeDependencyName(value: string) {
   return value.length > 0 && value.length <= 214 && /^[a-zA-Z0-9@._/-]+$/.test(value);
 }
 
-function isProposedFixValidationRequest(value: unknown): value is {
+type ProposedFixValidationRequest = {
   owner: string;
   repository: string;
   dependencyName: string;
@@ -529,14 +559,19 @@ function isProposedFixValidationRequest(value: unknown): value is {
   analysisTicket: string;
   proposal: unknown;
   proposedFixTicket: string;
-} {
+  validationAttemptId: string;
+};
+
+function isProposedFixValidationRequest(value: unknown): value is ProposedFixValidationRequest {
   return isRecord(value)
     && typeof value.owner === "string"
     && typeof value.repository === "string"
     && typeof value.dependencyName === "string"
     && typeof value.dependencyType === "string"
     && typeof value.analysisTicket === "string"
-    && typeof value.proposedFixTicket === "string";
+    && typeof value.proposedFixTicket === "string"
+    && typeof value.validationAttemptId === "string"
+    && /^[a-f\d]{8}-[a-f\d]{4}-[1-5][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i.test(value.validationAttemptId);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

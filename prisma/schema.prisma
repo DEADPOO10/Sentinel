@@ -193,6 +193,7 @@ model ProposedFix {
 model ValidationRun {
   id              String                  @id @default(cuid())
   proposedFixId   String
+  idempotencyKey  String?                 @unique
   overallStatus   ValidationOverallStatus
   baseCommitSha   String
   installStatus   ValidationStageStatus
