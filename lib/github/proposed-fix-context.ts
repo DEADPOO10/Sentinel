@@ -28,7 +28,7 @@ export type ProposedFixContext = {
   files: ProposedFixContextFile[];
 };
 
-export async function getProposedFixContext(owner: string, repository: string, dependency: PackageDependency, usage: RepositoryUsageContext): Promise<ProposedFixContext> {
+export async function getProposedFixContext(owner: string, repository: string, dependency: PackageDependency, usage: RepositoryUsageContext, ref?: string): Promise<ProposedFixContext> {
   if (!isValidGitHubRepository(owner, repository)) return unavailableContext();
 
   const accessToken = await getGitHubAccessTokenForCurrentUser();
@@ -40,11 +40,12 @@ export async function getProposedFixContext(owner: string, repository: string, d
     if (!repositoryResponse.ok) return unavailableContext();
 
     const defaultBranch = getDefaultBranch(await repositoryResponse.json());
-    if (!defaultBranch) return unavailableContext();
+    const sourceRef = ref && isSafeGitReference(ref) ? ref : defaultBranch;
+    if (!sourceRef) return unavailableContext();
 
     const packageJson = createPackageJsonDependencyContext(dependency);
     const sourceUsages = deduplicateUsages(usage).slice(0, PROPOSED_FIX_CONTEXT_LIMITS.maxSourceFiles);
-    const sourceFiles = await fetchSourceFiles(sourceUsages, owner, repository, defaultBranch, accessToken, packageJson.length);
+    const sourceFiles = await fetchSourceFiles(sourceUsages, owner, repository, sourceRef, accessToken, packageJson.length);
 
     return { status: "ready", files: [{ path: "package.json", content: packageJson }, ...sourceFiles] };
   } catch {
@@ -150,6 +151,13 @@ function isSafeSourcePath(path: string) {
 
   const extension = basename.split(".").at(-1);
   return !!extension && SOURCE_EXTENSIONS.has(extension);
+}
+
+function isSafeGitReference(value: string) {
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(value)
+    && !value.includes("..")
+    && !value.includes("//")
+    && !value.endsWith("/");
 }
 
 async function readBoundedText(response: Response, maximumBytes: number) {

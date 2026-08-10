@@ -31,6 +31,7 @@ type CheckName = "typecheck" | "lint" | "test" | "build";
 type CheckStatus = "passed" | "failed" | "skipped" | "timed_out";
 type PackageManager = "npm" | "pnpm" | "yarn";
 type PackageManagerMode = "lockfile" | "package_json_fallback";
+export type ProposedFixValidationPartialReason = "skipped_checks" | "no_lockfile_fallback" | "cleanup_unconfirmed";
 type PackageManagerDetection = { kind: "ready"; manager: PackageManager; mode: PackageManagerMode } | { kind: "ambiguous" } | { kind: "missing" };
 type ValidationManifest = { scripts: Record<string, string>; packageManager: string | null };
 type WorkspacePreparationStage = "temp_directory_create" | "archive_download" | "archive_http_error" | "archive_too_large" | "archive_extract" | "extracted_root_missing" | "sanitize_repository" | "repository_too_large" | "package_json_missing" | "patch_preparation" | "filesystem_permission" | "unexpected_workspace_error";
@@ -40,6 +41,8 @@ const VALIDATION_CHECK_NAMES: CheckName[] = ["typecheck", "lint", "test", "build
 
 export type ProposedFixValidationResult = {
   overallStatus: OverallValidationStatus;
+  baseBranch: string | null;
+  baseCommitSha: string | null;
   install: { status: InstallStatus; summary: string };
   checks: Array<{
     name: CheckName;
@@ -48,12 +51,14 @@ export type ProposedFixValidationResult = {
     summary: string;
   }>;
   warnings: string[];
+  partialReasons: ProposedFixValidationPartialReason[];
 };
 
 type ValidationInput = {
   owner: string;
   repository: string;
   defaultBranch: string;
+  baseCommitSha: string;
   dependencyType: "dependency" | "devDependency" | "peerDependency" | "optionalDependency";
   proposedFix: ProposedFix;
 };
@@ -82,7 +87,10 @@ type ArchiveMetadata = {
 
 export async function validateProposedFixInTemporaryWorkspace(input: ValidationInput): Promise<ProposedFixValidationResult> {
   if (process.env.SENTINEL_VALIDATION_ENABLED !== "true") {
-    return createUnableToValidateResult("Validation runtime unavailable in this environment. Enable the isolated local validation runtime to run repository commands.");
+    return addValidationBase(createUnableToValidateResult("Validation runtime unavailable in this environment. Enable the isolated local validation runtime to run repository commands."), input);
+  }
+  if (!isSafeGitCommitSha(input.baseCommitSha)) {
+    return addValidationBase(createUnableToValidateResult("The repository base commit could not be safely prepared for validation."), input);
   }
 
   let temporaryRoot: string | null = null;
@@ -92,7 +100,7 @@ export async function validateProposedFixInTemporaryWorkspace(input: ValidationI
     const accessToken = await getGitHubAccessTokenForCurrentUser();
     if (!accessToken) {
       result = createUnableToValidateResult("GitHub authorization is unavailable for isolated validation.");
-      return result;
+      return addValidationBase(result, input);
     }
 
     let archivePath: string;
@@ -129,7 +137,7 @@ export async function validateProposedFixInTemporaryWorkspace(input: ValidationI
     }
   }
 
-  return result;
+  return addValidationBase(result, input);
 }
 
 async function runValidationWorkflow(input: {
@@ -186,12 +194,15 @@ async function runValidationWorkflow(input: {
   if (!isSuccessfulCommand(installExecution)) {
     return {
       overallStatus: "failed",
+      baseBranch: null,
+      baseCommitSha: null,
       install: { status: "failed", summary: getInstallFailureSummary(installExecution) },
       checks: createSkippedChecks("Skipped because dependency installation did not complete."),
       warnings: [
         ...getBaseWarnings(sanitization.removedEntries, input.input.proposedFix.packageJsonChange.required, packageManager.mode),
         ...getOutputTruncationWarnings([{ stage: "install", result: installExecution }]),
       ],
+      partialReasons: [],
     };
   }
 
@@ -208,23 +219,32 @@ async function runValidationWorkflow(input: {
   if (executedChecks.length === 0) {
     return {
       overallStatus: "unable_to_validate",
+      baseBranch: null,
+      baseCommitSha: null,
       install: { status: "passed", summary: getInstallSuccessSummary(packageManager.mode) },
       checks,
       warnings: [...warnings, "No supported typecheck, lint, test, or build scripts were found."],
+      partialReasons: [],
     };
   }
 
   return {
     overallStatus: failedCheck ? "failed" : skippedCheck || packageManager.mode === "package_json_fallback" ? "partial" : "passed",
+    baseBranch: null,
+    baseCommitSha: null,
     install: { status: "passed", summary: getInstallSuccessSummary(packageManager.mode) },
     checks,
     warnings,
+    partialReasons: [
+      ...(skippedCheck ? ["skipped_checks" as const] : []),
+      ...(packageManager.mode === "package_json_fallback" ? ["no_lockfile_fallback" as const] : []),
+    ],
   };
 }
 
 async function downloadRepositoryArchive(input: Omit<ValidationInput, "proposedFix">, accessToken: string, archivePath: string, timeoutMs: number) {
   if (timeoutMs <= 0) throw new ValidationRuntimeError("validation_time_limit", "archive_download", { timeoutCategory: "validation_time_limit" });
-  const archiveUrl = new URL(`/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/zipball/${encodeURIComponent(input.defaultBranch)}`, GITHUB_API_ORIGIN);
+  const archiveUrl = new URL(`/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/zipball/${encodeURIComponent(input.baseCommitSha)}`, GITHUB_API_ORIGIN);
   let response: Response;
   try {
     response = await fetch(archiveUrl, {
@@ -826,10 +846,25 @@ function getInstallSuccessSummary(packageManagerMode: PackageManagerMode) {
 export function createUnableToValidateResult(summary: string): ProposedFixValidationResult {
   return {
     overallStatus: "unable_to_validate",
+    baseBranch: null,
+    baseCommitSha: null,
     install: { status: "skipped", summary },
     checks: createSkippedChecks("Validation did not run."),
     warnings: ["Validation ran nowhere; no repository files were changed or pushed."],
+    partialReasons: [],
   };
+}
+
+export function isProposedFixValidationEligibleForDraftPullRequest(result: ProposedFixValidationResult) {
+  const hasPassedCheck = result.checks.some((check) => check.status === "passed");
+  const checksAreSuccessfulOrSkipped = result.checks.every((check) => check.status === "passed" || check.status === "skipped");
+  const baseRequirementsMet = result.install.status === "passed" && hasPassedCheck && checksAreSuccessfulOrSkipped;
+  if (result.overallStatus === "passed") return baseRequirementsMet && result.partialReasons.length === 0 && result.checks.every((check) => check.status === "passed");
+  if (result.overallStatus !== "partial") return false;
+
+  return baseRequirementsMet
+    && result.partialReasons.length > 0
+    && result.partialReasons.every((reason) => reason === "skipped_checks" || reason === "no_lockfile_fallback");
 }
 
 type PatchApplicationResult = { applied: true } | { applied: false; category: "invalid_source_path" | "source_file_unavailable" | "original_snippet_mismatch" | "invalid_package_json_change" };
@@ -900,7 +935,16 @@ function addCleanupWarning(result: ProposedFixValidationResult): ProposedFixVali
     ...result,
     overallStatus: result.overallStatus === "passed" ? "partial" : result.overallStatus,
     warnings: [...result.warnings, "Temporary workspace cleanup could not be fully confirmed."],
+    partialReasons: [...new Set([...result.partialReasons, "cleanup_unconfirmed" as const])],
   };
+}
+
+function addValidationBase(result: ProposedFixValidationResult, input: Pick<ValidationInput, "defaultBranch" | "baseCommitSha">): ProposedFixValidationResult {
+  return { ...result, baseBranch: input.defaultBranch, baseCommitSha: input.baseCommitSha };
+}
+
+function isSafeGitCommitSha(value: string) {
+  return /^[a-f\d]{40,64}$/i.test(value);
 }
 
 function githubHeaders(accessToken: string) {

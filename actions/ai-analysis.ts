@@ -2,17 +2,20 @@
 
 import { requireUser } from "@/lib/auth/session";
 import { getRepositoryDependencyUsage, type RepositoryUsageContext } from "@/lib/github/dependency-usage";
+import { createDraftPullRequestFromVerifiedChanges, getGitHubRepositoryBaseForCurrentUser, type DraftPullRequestActionResult as GitHubDraftPullRequestActionResult } from "@/lib/github/draft-pull-request";
 import { getProposedFixContext } from "@/lib/github/proposed-fix-context";
 import { getGitHubPackageJson, isValidGitHubRepository } from "@/lib/github/package-json";
-import { createImpactAnalysisTicket, createProposedFixValidationTicket, getImpactAnalysisSnapshot, getProposedFixValidationSnapshot, verifyImpactAnalysisTicket, verifyProposedFixValidationTicket } from "@/lib/impact-analysis-ticket";
+import { createCompletedValidationPrTicket, createImpactAnalysisTicket, createProposedFixValidationTicket, getCompletedValidationResultSnapshot, getImpactAnalysisSnapshot, getProposedFixValidationSnapshot, verifyCompletedValidationPrTicket, verifyImpactAnalysisTicket, verifyProposedFixValidationTicket } from "@/lib/impact-analysis-ticket";
 import { generateProposedFix, isProposedFixVerifiedForValidation, type ProposedFixResult } from "@/lib/openai/proposed-fix";
 import { analyzeDependencyImpact, type DependencyImpactAnalysis } from "@/lib/openai/impact-analysis";
 import { getReleaseInformation, type ReleaseInformationContext } from "@/lib/release-information";
-import { createUnableToValidateResult, validateProposedFixInTemporaryWorkspace, type ProposedFixValidationResult } from "@/lib/validation/proposed-fix-validation";
+import { createUnableToValidateResult, isProposedFixValidationEligibleForDraftPullRequest, validateProposedFixInTemporaryWorkspace, type ProposedFixValidationResult } from "@/lib/validation/proposed-fix-validation";
 
 const dependencyTypes = new Set(["dependency", "devDependency", "peerDependency", "optionalDependency"]);
 
 export type DependencyImpactAnalysisActionResult = { analysis: DependencyImpactAnalysis & { risk: "low" | "medium" | "high"; repositoryUsage: RepositoryUsageContext; releaseInformation: ReleaseInformationContext }; analysisTicket: string } | { error: string };
+export type ProposedFixValidationActionResult = { validation: ProposedFixValidationResult; validationTicket?: string };
+export type DraftPullRequestActionResult = GitHubDraftPullRequestActionResult;
 
 export async function requestDependencyImpactAnalysis(input: { owner: string; repository: string; dependencyName: string; dependencyType: string }): Promise<DependencyImpactAnalysisActionResult> {
   const user = await requireUser();
@@ -167,22 +170,22 @@ export async function requestProposedFix(input: { owner: string; repository: str
   return { ...proposedFixResult, validationTicket };
 }
 
-export async function requestProposedFixValidation(input: unknown): Promise<ProposedFixValidationResult> {
+export async function requestProposedFixValidation(input: unknown): Promise<ProposedFixValidationActionResult> {
   const user = await requireUser();
   if (!isProposedFixValidationRequest(input)) {
     logSafeProposedFixActionEvent("validation_preflight_failed", { category: "invalid_request" });
-    return createUnableToValidateResult("A fresh proposed fix is required before validation can run.");
+    return validationActionResult(createUnableToValidateResult("A fresh proposed fix is required before validation can run."));
   }
 
   const impactAnalysis = getImpactAnalysisSnapshot(input.analysis);
   const proposedFix = getProposedFixValidationSnapshot(input.proposal);
   if (!impactAnalysis || !proposedFix) {
     logSafeProposedFixActionEvent("validation_preflight_failed", { category: "invalid_client_snapshot" });
-    return createUnableToValidateResult("A fresh proposed fix is required before validation can run.");
+    return validationActionResult(createUnableToValidateResult("A fresh proposed fix is required before validation can run."));
   }
   if (!isValidGitHubRepository(input.owner, input.repository) || !isSafeDependencyName(input.dependencyName) || !dependencyTypes.has(input.dependencyType)) {
     logSafeProposedFixActionEvent("validation_preflight_failed", { category: "invalid_repository_or_dependency" });
-    return createUnableToValidateResult("This proposed fix cannot be validated.");
+    return validationActionResult(createUnableToValidateResult("This proposed fix cannot be validated."));
   }
   if (!verifyImpactAnalysisTicket(input.analysisTicket, {
     userId: user.id,
@@ -193,7 +196,7 @@ export async function requestProposedFixValidation(input: unknown): Promise<Prop
     analysis: impactAnalysis,
   })) {
     logSafeProposedFixActionEvent("validation_preflight_failed", { category: "invalid_or_expired_analysis_ticket" });
-    return createUnableToValidateResult("Generate a fresh AI impact analysis before validating this proposal.");
+    return validationActionResult(createUnableToValidateResult("Generate a fresh AI impact analysis before validating this proposal."));
   }
   if (!verifyProposedFixValidationTicket(input.proposedFixTicket, {
     userId: user.id,
@@ -204,7 +207,7 @@ export async function requestProposedFixValidation(input: unknown): Promise<Prop
     proposedFix,
   })) {
     logSafeProposedFixActionEvent("validation_preflight_failed", { category: "invalid_or_expired_proposed_fix_ticket" });
-    return createUnableToValidateResult("Generate a fresh proposed fix before validation can run.");
+    return validationActionResult(createUnableToValidateResult("Generate a fresh proposed fix before validation can run."));
   }
 
   let packageJsonResult;
@@ -212,22 +215,28 @@ export async function requestProposedFixValidation(input: unknown): Promise<Prop
     packageJsonResult = await getGitHubPackageJson(input.owner, input.repository);
   } catch {
     logSafeProposedFixActionEvent("validation_preflight_failed", { category: "repository_access_request_failed" });
-    return createUnableToValidateResult("Repository access could not be revalidated for this proposal.");
+    return validationActionResult(createUnableToValidateResult("Repository access could not be revalidated for this proposal."));
   }
   if (packageJsonResult.kind !== "ready") {
     logSafeProposedFixActionEvent("validation_preflight_failed", { category: "repository_dependency_data_unavailable" });
-    return createUnableToValidateResult("Repository dependency data could not be revalidated for this proposal.");
+    return validationActionResult(createUnableToValidateResult("Repository dependency data could not be revalidated for this proposal."));
   }
 
   const dependency = packageJsonResult.manifest.dependencies.find((item) => item.name === input.dependencyName && item.type === input.dependencyType);
   if (!dependency || dependency.status !== "update-available" || !dependency.latestVersion || !dependency.changeType || !dependency.risk) {
     logSafeProposedFixActionEvent("validation_preflight_failed", { category: "dependency_not_eligible" });
-    return createUnableToValidateResult("This dependency no longer has a validated update available.");
+    return validationActionResult(createUnableToValidateResult("This dependency no longer has a validated update available."));
+  }
+
+  const repositoryBase = await getGitHubRepositoryBaseForCurrentUser(packageJsonResult.repository.owner, packageJsonResult.repository.name);
+  if (repositoryBase.kind !== "ready" || repositoryBase.repository.defaultBranch !== packageJsonResult.repository.defaultBranch) {
+    logSafeProposedFixActionEvent("validation_preflight_failed", { category: repositoryBase.kind === "error" ? `base_commit_${repositoryBase.category}` : "base_branch_changed" });
+    return validationActionResult(createUnableToValidateResult("The repository changed while Sentinel prepared validation. Run analysis again before validating this proposal."));
   }
 
   let repositoryUsage: RepositoryUsageContext;
   try {
-    repositoryUsage = await getRepositoryDependencyUsage(packageJsonResult.repository.owner, packageJsonResult.repository.name, dependency.name);
+    repositoryUsage = await getRepositoryDependencyUsage(packageJsonResult.repository.owner, packageJsonResult.repository.name, dependency.name, repositoryBase.repository.baseCommitSha);
   } catch {
     repositoryUsage = getUnavailableRepositoryUsageContext();
     logSafeProposedFixActionEvent("validation_context_unavailable", { category: "repository_usage" });
@@ -235,10 +244,10 @@ export async function requestProposedFixValidation(input: unknown): Promise<Prop
 
   let fixContext;
   try {
-    fixContext = await getProposedFixContext(packageJsonResult.repository.owner, packageJsonResult.repository.name, dependency, repositoryUsage);
+    fixContext = await getProposedFixContext(packageJsonResult.repository.owner, packageJsonResult.repository.name, dependency, repositoryUsage, repositoryBase.repository.baseCommitSha);
   } catch {
     logSafeProposedFixActionEvent("validation_preflight_failed", { category: "verified_context_request_failed" });
-    return createUnableToValidateResult("Verified repository context could not be prepared for this proposal.");
+    return validationActionResult(createUnableToValidateResult("Verified repository context could not be prepared for this proposal."));
   }
 
   const dependencyForValidation = {
@@ -251,16 +260,233 @@ export async function requestProposedFixValidation(input: unknown): Promise<Prop
   };
   if (!isProposedFixVerifiedForValidation({ proposal: proposedFix, dependency: dependencyForValidation, fixContext })) {
     logSafeProposedFixActionEvent("validation_preflight_failed", { category: "proposed_changes_not_verified" });
-    return createUnableToValidateResult("Sentinel could not verify the proposed changes against the current repository context.");
+    return validationActionResult(createUnableToValidateResult("Sentinel could not verify the proposed changes against the current repository context."));
   }
 
-  return validateProposedFixInTemporaryWorkspace({
-    owner: packageJsonResult.repository.owner,
-    repository: packageJsonResult.repository.name,
-    defaultBranch: packageJsonResult.repository.defaultBranch,
+  const validation = await validateProposedFixInTemporaryWorkspace({
+    owner: repositoryBase.repository.owner,
+    repository: repositoryBase.repository.repository,
+    defaultBranch: repositoryBase.repository.defaultBranch,
+    baseCommitSha: repositoryBase.repository.baseCommitSha,
     dependencyType: dependency.type,
     proposedFix,
   });
+  if (!isProposedFixValidationEligibleForDraftPullRequest(validation) || !isPullRequestCreationEnabled()) return validationActionResult(validation);
+  if (validation.baseBranch !== repositoryBase.repository.defaultBranch || validation.baseCommitSha !== repositoryBase.repository.baseCommitSha) {
+    logSafeProposedFixActionEvent("validation_ticket_unavailable", { category: "validation_base_binding_mismatch" });
+    return validationActionResult(validation);
+  }
+
+  const validationTicket = createCompletedValidationPrTicket({
+    userId: user.id,
+    owner: repositoryBase.repository.owner,
+    repository: repositoryBase.repository.repository,
+    dependencyName: dependency.name,
+    dependencyType: dependency.type,
+    defaultBranch: repositoryBase.repository.defaultBranch,
+    baseCommitSha: repositoryBase.repository.baseCommitSha,
+    analysis: impactAnalysis,
+    proposedFix,
+    validationResult: getValidationTicketSnapshotInput(validation),
+  });
+  if (!validationTicket) {
+    logSafeProposedFixActionEvent("validation_ticket_unavailable", { category: "completed_validation_ticket_unavailable" });
+    return validationActionResult(validation);
+  }
+  return validationActionResult(validation, validationTicket);
+}
+
+const draftPullRequestRequests = new Map<string, Promise<DraftPullRequestActionResult>>();
+
+export async function requestDraftPullRequest(input: unknown): Promise<DraftPullRequestActionResult> {
+  const user = await requireUser();
+  if (!isPullRequestCreationEnabled()) {
+    return { kind: "error", error: "Draft pull request creation is disabled in this environment." };
+  }
+  if (!isDraftPullRequestRequest(input)) {
+    logSafePrActionEvent("creation_preflight_failed", { category: "invalid_request" });
+    return { kind: "error", error: "A fresh validated proposal is required before creating a draft PR." };
+  }
+  if (!isValidGitHubRepository(input.owner, input.repository) || !isSafeDependencyName(input.dependencyName) || !dependencyTypes.has(input.dependencyType)) {
+    logSafePrActionEvent("creation_preflight_failed", { category: "invalid_repository_or_dependency" });
+    return { kind: "error", error: "A fresh validated proposal is required before creating a draft PR." };
+  }
+
+  const impactAnalysis = getImpactAnalysisSnapshot(input.analysis);
+  const proposedFix = getProposedFixValidationSnapshot(input.proposal);
+  const validation = getDraftPullRequestValidationResult(input.validation);
+  if (!impactAnalysis || !proposedFix || !validation) {
+    logSafePrActionEvent("creation_preflight_failed", { category: "invalid_client_snapshot" });
+    return { kind: "error", error: "A fresh validated proposal is required before creating a draft PR." };
+  }
+  if (!verifyImpactAnalysisTicket(input.analysisTicket, {
+    userId: user.id,
+    owner: input.owner,
+    repository: input.repository,
+    dependencyName: input.dependencyName,
+    dependencyType: input.dependencyType,
+    analysis: impactAnalysis,
+  }) || !verifyProposedFixValidationTicket(input.proposedFixTicket, {
+    userId: user.id,
+    owner: input.owner,
+    repository: input.repository,
+    dependencyName: input.dependencyName,
+    dependencyType: input.dependencyType,
+    proposedFix,
+  })) {
+    logSafePrActionEvent("creation_preflight_failed", { category: "invalid_analysis_or_proposal_ticket" });
+    return { kind: "error", error: "Generate and validate a fresh proposed fix before creating a draft PR." };
+  }
+
+  const validationBinding = verifyCompletedValidationPrTicket(input.validationTicket, {
+    userId: user.id,
+    owner: input.owner,
+    repository: input.repository,
+    dependencyName: input.dependencyName,
+    dependencyType: input.dependencyType,
+    analysis: impactAnalysis,
+    proposedFix,
+    validationResult: getValidationTicketSnapshotInput(validation),
+  });
+  if (!validationBinding || !isProposedFixValidationEligibleForDraftPullRequest(validation)) {
+    logSafePrActionEvent("creation_preflight_failed", { category: "invalid_or_ineligible_validation_ticket" });
+    return { kind: "error", error: "Run a fresh eligible validation before creating a draft PR." };
+  }
+  if (validation.baseBranch !== validationBinding.defaultBranch || validation.baseCommitSha !== validationBinding.baseCommitSha) {
+    logSafePrActionEvent("creation_preflight_failed", { category: "validation_base_binding_mismatch" });
+    return { kind: "error", error: "The repository changed after validation. Run analysis and validation again before creating a PR." };
+  }
+
+  const packageJsonResult = await getGitHubPackageJson(input.owner, input.repository).catch(() => null);
+  if (!packageJsonResult || packageJsonResult.kind !== "ready") {
+    logSafePrActionEvent("creation_preflight_failed", { category: "repository_dependency_data_unavailable" });
+    return { kind: "error", error: "Repository dependency data could not be revalidated before creating a draft PR." };
+  }
+  const dependency = packageJsonResult.manifest.dependencies.find((item) => item.name === input.dependencyName && item.type === input.dependencyType);
+  if (!dependency || dependency.status !== "update-available" || !dependency.latestVersion || !dependency.changeType || !dependency.risk
+    || dependency.version !== proposedFix.packageJsonChange.from
+    || dependency.latestVersion !== proposedFix.packageJsonChange.to
+    || proposedFix.packageJsonChange.dependency !== dependency.name) {
+    logSafePrActionEvent("creation_preflight_failed", { category: "dependency_changed" });
+    return { kind: "error", error: "This dependency no longer has the expected update. Run analysis and validation again." };
+  }
+
+  const repositoryBase = await getGitHubRepositoryBaseForCurrentUser(input.owner, input.repository, true);
+  if (repositoryBase.kind !== "ready") {
+    logSafePrActionEvent("creation_preflight_failed", { category: `repository_${repositoryBase.category}` });
+    return { kind: "error", error: getRepositoryWritePreflightError(repositoryBase.category) };
+  }
+  if (repositoryBase.repository.defaultBranch !== validationBinding.defaultBranch || repositoryBase.repository.baseCommitSha !== validationBinding.baseCommitSha) {
+    logSafePrActionEvent("creation_preflight_failed", { category: "stale_base_commit" });
+    return { kind: "error", error: "The repository changed after validation. Run analysis and validation again before creating a PR." };
+  }
+
+  const draftPullRequestInput = {
+    owner: repositoryBase.repository.owner,
+    repository: repositoryBase.repository.repository,
+    defaultBranch: validationBinding.defaultBranch,
+    baseCommitSha: validationBinding.baseCommitSha,
+    dependency: {
+      name: dependency.name,
+      declaredVersion: dependency.version,
+      latestVersion: dependency.latestVersion,
+      changeType: dependency.changeType,
+      risk: dependency.risk,
+      dependencyType: dependency.type,
+    },
+    proposedFix,
+    validation,
+    impactAnalysis,
+    proposedChangeIdentifier: validationBinding.proposedChangeIdentifier,
+  };
+
+  return runDraftPullRequestIdempotently(input.validationTicket, () => createDraftPullRequestFromVerifiedChanges(draftPullRequestInput));
+}
+
+function validationActionResult(validation: ProposedFixValidationResult, validationTicket?: string): ProposedFixValidationActionResult {
+  return validationTicket ? { validation, validationTicket } : { validation };
+}
+
+function getValidationTicketSnapshotInput(validation: ProposedFixValidationResult) {
+  return {
+    overallStatus: validation.overallStatus,
+    install: validation.install,
+    checks: validation.checks,
+    warnings: validation.warnings,
+    partialReasons: validation.partialReasons,
+  };
+}
+
+function getDraftPullRequestValidationResult(value: unknown): ProposedFixValidationResult | null {
+  if (!isRecord(value) || typeof value.baseBranch !== "string" || !isSafeGitReference(value.baseBranch) || typeof value.baseCommitSha !== "string" || !isSafeGitCommitSha(value.baseCommitSha) || !Array.isArray(value.partialReasons)) return null;
+  const snapshot = getCompletedValidationResultSnapshot({
+    overallStatus: value.overallStatus,
+    install: value.install,
+    checks: value.checks,
+    warnings: value.warnings,
+    partialReasons: value.partialReasons,
+  });
+  if (!snapshot) return null;
+
+  return {
+    ...snapshot,
+    baseBranch: value.baseBranch,
+    baseCommitSha: value.baseCommitSha.toLowerCase(),
+  };
+}
+
+function isDraftPullRequestRequest(value: unknown): value is {
+  owner: string;
+  repository: string;
+  dependencyName: string;
+  dependencyType: string;
+  analysis: unknown;
+  analysisTicket: string;
+  proposal: unknown;
+  proposedFixTicket: string;
+  validation: unknown;
+  validationTicket: string;
+} {
+  return isRecord(value)
+    && typeof value.owner === "string"
+    && typeof value.repository === "string"
+    && typeof value.dependencyName === "string"
+    && typeof value.dependencyType === "string"
+    && typeof value.analysisTicket === "string"
+    && typeof value.proposedFixTicket === "string"
+    && typeof value.validationTicket === "string";
+}
+
+function runDraftPullRequestIdempotently(ticket: string, create: () => Promise<DraftPullRequestActionResult>) {
+  const activeRequest = draftPullRequestRequests.get(ticket);
+  if (activeRequest) return activeRequest;
+
+  const request = create().finally(() => {
+    draftPullRequestRequests.delete(ticket);
+  });
+  draftPullRequestRequests.set(ticket, request);
+  return request;
+}
+
+function getRepositoryWritePreflightError(category: string) {
+  if (category === "write_access" || category === "repository_restricted") return "GitHub write access could not be verified for this repository.";
+  if (category === "github_authorization") return "GitHub authorization is unavailable. Reconnect GitHub and try again.";
+  return "GitHub could not revalidate this repository before creating a draft PR.";
+}
+
+function isSafeGitReference(value: string) {
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(value)
+    && !value.includes("..")
+    && !value.includes("//")
+    && !value.endsWith("/");
+}
+
+function isSafeGitCommitSha(value: string) {
+  return /^[a-f\d]{40,64}$/i.test(value);
+}
+
+function isPullRequestCreationEnabled() {
+  return process.env.SENTINEL_PR_CREATION_ENABLED === "true";
 }
 
 function isSafeDependencyName(value: string) {
@@ -328,4 +554,8 @@ function logSafeAiActionEvent(event: string, details: Record<string, string>) {
 
 function logSafeProposedFixActionEvent(event: string, details: Record<string, string>) {
   console.error("[sentinel:proposed-fix-action]", event, details);
+}
+
+function logSafePrActionEvent(event: string, details: Record<string, string>) {
+  console.error("[sentinel:pr]", event, details);
 }

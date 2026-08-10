@@ -40,7 +40,7 @@ class RepositoryUsageError extends Error {
   }
 }
 
-export async function getRepositoryDependencyUsage(owner: string, repository: string, dependencyName: string): Promise<RepositoryUsageContext> {
+export async function getRepositoryDependencyUsage(owner: string, repository: string, dependencyName: string, ref?: string): Promise<RepositoryUsageContext> {
   if (!isValidGitHubRepository(owner, repository) || !isSafeDependencyName(dependencyName)) return unavailableUsageContext();
 
   try {
@@ -63,8 +63,9 @@ export async function getRepositoryDependencyUsage(owner: string, repository: st
       return unavailableUsageContext();
     }
 
+    const inspectionRef = ref && isSafeGitReference(ref) ? ref : repositoryDetails.defaultBranch;
     const candidatePaths = await findCandidateSourceFiles(owner, repository, dependencyName, accessToken);
-    const inspectedFiles = await inspectCandidateFiles(candidatePaths, owner, repository, repositoryDetails.defaultBranch, dependencyName, accessToken);
+    const inspectedFiles = await inspectCandidateFiles(candidatePaths, owner, repository, inspectionRef, dependencyName, accessToken);
     const usages = limitUsageContext(inspectedFiles);
 
     return {
@@ -238,6 +239,13 @@ function isInspectableSourcePath(path: string) {
 
 function isSafeDependencyName(value: string) {
   return value.length > 0 && value.length <= 214 && /^[a-zA-Z0-9@._/-]+$/.test(value);
+}
+
+function isSafeGitReference(value: string) {
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(value)
+    && !value.includes("..")
+    && !value.includes("//")
+    && !value.endsWith("/");
 }
 
 function escapeRegularExpression(value: string) {
