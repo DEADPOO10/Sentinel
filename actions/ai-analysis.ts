@@ -1,6 +1,7 @@
 "use server";
 
 import { requireUser } from "@/lib/auth/session";
+import { persistImpactAnalysisForFinding } from "@/lib/db/impact-analyses";
 import { getRepositoryDependencyUsage, type RepositoryUsageContext } from "@/lib/github/dependency-usage";
 import { createDraftPullRequestFromVerifiedChanges, getGitHubRepositoryBaseForCurrentUser, type DraftPullRequestActionResult as GitHubDraftPullRequestActionResult } from "@/lib/github/draft-pull-request";
 import { getProposedFixContext } from "@/lib/github/proposed-fix-context";
@@ -84,6 +85,17 @@ export async function requestDependencyImpactAnalysis(input: { owner: string; re
 
   if ("error" in analysisResult) return analysisResult;
   const analysis = { ...analysisResult.analysis, risk: dependency.risk, repositoryUsage, releaseInformation };
+  await persistImpactAnalysisForFinding({
+    githubRepositoryId: result.repository.githubRepositoryId,
+    baseCommitSha: result.repository.baseCommitSha,
+    dependency: {
+      packageName: dependency.name,
+      dependencyType: dependency.type,
+      declaredVersion: dependency.version,
+      latestVersion: dependency.latestVersion,
+    },
+    analysis,
+  });
   const analysisTicket = createImpactAnalysisTicket({ userId: user.id, owner: result.repository.owner, repository: result.repository.name, dependencyName: dependency.name, dependencyType: dependency.type, analysis });
   if (!analysisTicket) return { error: "Fix generation could not be enabled for this environment." };
 
