@@ -1,0 +1,224 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum RepositoryVisibility {
+  PUBLIC
+  PRIVATE
+  INTERNAL
+}
+
+enum ScanStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum DependencyType {
+  DEPENDENCY
+  DEV_DEPENDENCY
+  PEER_DEPENDENCY
+  OPTIONAL_DEPENDENCY
+}
+
+enum FindingStatus {
+  UP_TO_DATE
+  UPDATE_AVAILABLE
+  AHEAD_OF_NPM_LATEST
+  UNKNOWN
+}
+
+enum ChangeType {
+  MAJOR
+  MINOR
+  PATCH
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum ProposedFixStatus {
+  PROPOSED
+  INSUFFICIENT_CONTEXT
+}
+
+enum ValidationOverallStatus {
+  PASSED
+  FAILED
+  PARTIAL
+  UNABLE_TO_VALIDATE
+}
+
+enum ValidationStageStatus {
+  PASSED
+  FAILED
+  SKIPPED
+  TIMED_OUT
+}
+
+enum PullRequestStatus {
+  DRAFT
+  OPEN
+  CLOSED
+  MERGED
+}
+
+model User {
+  id           String           @id @default(cuid())
+  githubUserId String           @unique
+  githubLogin  String
+  name         String?
+  email        String?
+  avatarUrl    String?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  repositories UserRepository[]
+
+  @@index([githubLogin])
+}
+
+model Repository {
+  id                 String               @id @default(cuid())
+  githubRepositoryId String               @unique
+  owner              String
+  name               String
+  fullName           String
+  visibility         RepositoryVisibility
+  defaultBranch      String
+  language           String?
+  githubUrl          String
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  users              UserRepository[]
+  scans              Scan[]
+
+  @@index([fullName])
+  @@index([owner, name])
+}
+
+model UserRepository {
+  id           String     @id @default(cuid())
+  userId       String
+  repositoryId String
+  createdAt    DateTime   @default(now())
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, repositoryId])
+  @@index([repositoryId])
+}
+
+model Scan {
+  id               String     @id @default(cuid())
+  repositoryId     String
+  status           ScanStatus @default(PENDING)
+  baseCommitSha    String?
+  dependencyCount  Int        @default(0)
+  updatesAvailable Int        @default(0)
+  highRiskCount    Int        @default(0)
+  startedAt        DateTime   @default(now())
+  completedAt      DateTime?
+  createdAt        DateTime   @default(now())
+  repository       Repository @relation(fields: [repositoryId], references: [id], onDelete: Restrict)
+  findings         Finding[]
+
+  @@index([repositoryId, createdAt])
+  @@index([status, createdAt])
+}
+
+model Finding {
+  id                       String         @id @default(cuid())
+  scanId                   String
+  packageName              String
+  dependencyType           DependencyType
+  declaredVersion          String
+  latestVersion            String?
+  changeType               ChangeType?
+  risk                     RiskLevel?
+  status                   FindingStatus
+  releaseEvidenceAvailable Boolean        @default(false)
+  repositoryUsageCount     Int            @default(0)
+  createdAt                DateTime       @default(now())
+  scan                     Scan           @relation(fields: [scanId], references: [id], onDelete: Restrict)
+  impactAnalysis           ImpactAnalysis?
+  proposedFixes            ProposedFix[]
+
+  @@unique([scanId, packageName, dependencyType])
+  @@index([status])
+}
+
+model ImpactAnalysis {
+  id                String    @id @default(cuid())
+  findingId         String    @unique
+  risk              RiskLevel
+  confidence        Int
+  summary           String
+  potentialImpact   String
+  riskExplanation   String
+  recommendation    String
+  createdAt         DateTime  @default(now())
+  finding           Finding   @relation(fields: [findingId], references: [id], onDelete: Restrict)
+}
+
+model ProposedFix {
+  id                    String            @id @default(cuid())
+  findingId             String
+  status                ProposedFixStatus
+  confidence            Int?
+  summary               String
+  packageJsonChangeJson Json
+  sourceChangesJson     Json
+  validationStepsJson   Json
+  warningsJson          Json
+  createdAt             DateTime          @default(now())
+  finding               Finding           @relation(fields: [findingId], references: [id], onDelete: Restrict)
+  validationRuns        ValidationRun[]
+  pullRequest           PullRequest?
+
+  @@index([findingId, createdAt])
+  @@index([status])
+}
+
+model ValidationRun {
+  id              String                  @id @default(cuid())
+  proposedFixId   String
+  overallStatus   ValidationOverallStatus
+  baseCommitSha   String
+  installStatus   ValidationStageStatus
+  typecheckStatus ValidationStageStatus?
+  lintStatus      ValidationStageStatus?
+  testStatus      ValidationStageStatus?
+  buildStatus     ValidationStageStatus?
+  warningsJson    Json
+  createdAt       DateTime                @default(now())
+  proposedFix     ProposedFix             @relation(fields: [proposedFixId], references: [id], onDelete: Restrict)
+
+  @@index([proposedFixId, createdAt])
+  @@index([overallStatus])
+}
+
+model PullRequest {
+  id              String            @id @default(cuid())
+  proposedFixId   String            @unique
+  githubPrNumber  Int
+  githubPrUrl     String
+  branchName      String
+  baseBranch      String
+  commitSha       String
+  draft           Boolean           @default(true)
+  status          PullRequestStatus @default(DRAFT)
+  createdAt       DateTime          @default(now())
+  proposedFix     ProposedFix       @relation(fields: [proposedFixId], references: [id], onDelete: Restrict)
+
+  @@index([githubPrNumber])
+  @@index([status])
+}

@@ -5,3 +5,4 @@ node_modules/
 .env.*.local
 .npm-cache/
 tsconfig.tsbuildinfo
+generated/prisma/

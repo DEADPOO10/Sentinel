@@ -6,15 +6,21 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "db:generate": "prisma generate",
+    "db:validate": "prisma validate",
+    "db:migrate": "prisma migrate dev"
   },
   "dependencies": {
+    "@prisma/adapter-pg": "^7.9.1",
+    "@prisma/client": "^7.9.1",
     "@radix-ui/react-slot": "^1.2.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^0.468.0",
     "next": "^15.5.22",
     "next-auth": "^5.0.0-beta.32",
+    "pg": "^8.23.0",
     "react": "19.1.1",
     "react-dom": "19.1.1",
     "semver": "^7.8.5",
@@ -24,11 +30,14 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.12",
     "@types/node": "^22.15.3",
+    "@types/pg": "^8.21.0",
     "@types/react": "^19.1.1",
     "@types/react-dom": "^19.1.1",
     "@types/yauzl": "^3.4.0",
+    "dotenv": "^17.4.2",
     "eslint": "^9.28.0",
     "eslint-config-next": "^15.5.22",
+    "prisma": "^7.9.1",
     "tailwindcss": "^4.1.12",
     "typescript": "^5.8.3"
   }
