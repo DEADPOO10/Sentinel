@@ -15,6 +15,10 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 
 type PageProps = { params: Promise<{ owner: string; repository: string }> };
 
+// This route owns Sentinel's bounded scan and user-triggered Server Actions.
+export const runtime = "nodejs";
+export const maxDuration = 90;
+
 export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
   const { owner, repository } = await params;
   return { title: isValidGitHubRepository(owner, repository) ? `${owner}/${repository} – Sentinel` : "Repository not found – Sentinel" };

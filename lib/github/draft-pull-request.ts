@@ -1,6 +1,6 @@
 import "server-only";
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { getGitHubAccessTokenForCurrentUser } from "@/lib/github/repositories";
 import { isValidGitHubRepository } from "@/lib/github/package-json";
 import type { ImpactAnalysisSnapshot } from "@/lib/impact-analysis-ticket";
@@ -21,7 +21,6 @@ export const DRAFT_PULL_REQUEST_LIMITS = {
   maxTreeResponseBytes: 8 * 1024 * 1024,
   maxOpenPullRequestsExamined: 100,
   maxBranchNameLength: 96,
-  maxBranchAttempts: 4,
 } as const;
 
 type GitHubHttpCategory = "rate_limited" | "server_error" | "client_error";
@@ -161,7 +160,7 @@ export async function createDraftPullRequestFromVerifiedChanges(input: VerifiedD
     createdCommitSha = await createCommit(input, treeSha, accessToken);
     logSafePrEvent("commit_created", { commitSha: createdCommitSha });
 
-    createdBranch = await createUniqueSentinelBranch(input, createdCommitSha, accessToken, (branchName) => {
+    createdBranch = await createSentinelProposalBranch(input, createdCommitSha, accessToken, (branchName) => {
       potentiallyCreatedBranch = branchName;
     });
     logSafePrEvent("branch_created", { branchName: createdBranch, commitSha: createdCommitSha });
@@ -195,6 +194,15 @@ export async function createDraftPullRequestFromVerifiedChanges(input: VerifiedD
     };
   } catch (error) {
     const cleanupBranch = createdBranch ?? potentiallyCreatedBranch;
+    if (isExistingProposalBranchError(error)) {
+      const existingLookup = await findExistingDraftPullRequestSafely(input, accessToken);
+      if (existingLookup.kind === "found") return existingLookup.pullRequest;
+      logSafePrEvent("idempotency_branch_reserved", {
+        stage: "branch_creation",
+        lookup: existingLookup.kind,
+      });
+      return { kind: "error", error: "A draft PR for this validated proposal is already being prepared. Refresh shortly before trying again." };
+    }
     if (pullRequestCreationAttempted && isAmbiguousPullRequestCreationError(error)) {
       const existingLookup = await findExistingDraftPullRequestSafely(input, accessToken);
       if (existingLookup.kind === "found") return existingLookup.pullRequest;
@@ -343,27 +351,27 @@ async function createCommit(input: VerifiedDraftPullRequestInput, treeSha: strin
   return sha;
 }
 
-async function createUniqueSentinelBranch(input: VerifiedDraftPullRequestInput, commitSha: string, accessToken: string, onPotentiallyCreatedBranch: (branchName: string) => void) {
-  for (let attempt = 0; attempt < DRAFT_PULL_REQUEST_LIMITS.maxBranchAttempts; attempt += 1) {
-    const branchName = createSentinelBranchName(input.dependency.name, input.dependency.latestVersion);
-    if (branchName === input.defaultBranch) continue;
-    try {
-      const response = await requestGitHub(input.owner, input.repository, accessToken, "POST", `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/refs`, "create_branch", {
-        ref: `refs/heads/${branchName}`,
-        sha: commitSha,
-      });
-      if (response.status === 201) return branchName;
-      throw new DraftPullRequestError("branch_creation", "create_branch_status", response.status);
-    } catch (error) {
-      if (isAmbiguousGitWriteError(error)) onPotentiallyCreatedBranch(branchName);
-      if (error instanceof DraftPullRequestError && error.status === 422 && attempt + 1 < DRAFT_PULL_REQUEST_LIMITS.maxBranchAttempts) continue;
-      if (error instanceof DraftPullRequestError && error.category === "github_api") {
-        throw new DraftPullRequestError("branch_creation", error.stage, error.status);
-      }
-      throw error;
+async function createSentinelProposalBranch(input: VerifiedDraftPullRequestInput, commitSha: string, accessToken: string, onPotentiallyCreatedBranch: (branchName: string) => void) {
+  const branchName = createSentinelBranchName(input.dependency.name, input.dependency.latestVersion, input.proposedChangeIdentifier);
+  if (branchName === input.defaultBranch) throw new DraftPullRequestError("branch_creation", "invalid_branch_name");
+
+  try {
+    const response = await requestGitHub(input.owner, input.repository, accessToken, "POST", `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/refs`, "create_branch", {
+      ref: `refs/heads/${branchName}`,
+      sha: commitSha,
+    });
+    if (response.status === 201) return branchName;
+    throw new DraftPullRequestError("branch_creation", "create_branch_status", response.status);
+  } catch (error) {
+    if (isAmbiguousGitWriteError(error)) onPotentiallyCreatedBranch(branchName);
+    if (error instanceof DraftPullRequestError && error.status === 422) {
+      throw new DraftPullRequestError("branch_creation", "branch_already_exists", error.status);
     }
+    if (error instanceof DraftPullRequestError && error.category === "github_api") {
+      throw new DraftPullRequestError("branch_creation", error.stage, error.status);
+    }
+    throw error;
   }
-  throw new DraftPullRequestError("branch_creation", "branch_collision");
 }
 
 async function createDraftPullRequest(input: VerifiedDraftPullRequestInput, branchName: string, accessToken: string) {
@@ -738,10 +746,10 @@ function skipJsonWhitespace(content: string, cursor: number) {
   return cursor;
 }
 
-function createSentinelBranchName(dependencyName: string, targetVersion: string) {
+function createSentinelBranchName(dependencyName: string, targetVersion: string, proposedChangeIdentifier: string) {
   const dependencySegment = sanitizeBranchSegment(dependencyName, "dependency", 48);
   const majorVersion = targetVersion.match(/\d+/)?.[0] ?? "update";
-  const suffix = randomBytes(4).toString("hex");
+  const suffix = proposedChangeIdentifier.slice(0, 12);
   const branch = `sentinel/${dependencySegment}-${majorVersion}-${suffix}`;
   return branch.slice(0, DRAFT_PULL_REQUEST_LIMITS.maxBranchNameLength).replace(/[-./]+$/, "");
 }
@@ -919,6 +927,13 @@ function hasUnsafeTextControlCharacters(value: string) {
 
 function isAmbiguousGitWriteError(error: unknown) {
   return error instanceof DraftPullRequestError && (error.category === "timeout" || error.category === "request_error");
+}
+
+function isExistingProposalBranchError(error: unknown) {
+  return error instanceof DraftPullRequestError
+    && error.category === "branch_creation"
+    && error.stage === "branch_already_exists"
+    && error.status === 422;
 }
 
 function isAmbiguousPullRequestCreationError(error: unknown) {

@@ -86,8 +86,9 @@ type ArchiveMetadata = {
 };
 
 export async function validateProposedFixInTemporaryWorkspace(input: ValidationInput): Promise<ProposedFixValidationResult> {
-  if (process.env.SENTINEL_VALIDATION_ENABLED !== "true") {
-    return addValidationBase(createUnableToValidateResult("Validation runtime unavailable in this environment. Enable the isolated local validation runtime to run repository commands."), input);
+  const runtimeUnavailableMessage = getValidationRuntimeUnavailableMessage();
+  if (runtimeUnavailableMessage) {
+    return addValidationBase(createUnableToValidateResult(runtimeUnavailableMessage), input);
   }
   if (!isSafeGitCommitSha(input.baseCommitSha)) {
     return addValidationBase(createUnableToValidateResult("The repository base commit could not be safely prepared for validation."), input);
@@ -138,6 +139,21 @@ export async function validateProposedFixInTemporaryWorkspace(input: ValidationI
   }
 
   return addValidationBase(result, input);
+}
+
+/**
+ * A temporary directory is useful local containment, but it is not a sandbox.
+ * Do not execute untrusted repository commands inside a production web function.
+ */
+function getValidationRuntimeUnavailableMessage() {
+  if (process.env.NODE_ENV === "production") {
+    logSafeValidationEvent("runtime_disabled", { reason: "production_host_execution_guard" });
+    return "Repository command validation is unavailable in this production environment until Sentinel uses a dedicated isolated validation worker.";
+  }
+  if (process.env.SENTINEL_VALIDATION_ENABLED !== "true") {
+    return "Validation runtime unavailable in this environment. Enable the isolated local validation runtime to run repository commands.";
+  }
+  return null;
 }
 
 async function runValidationWorkflow(input: {
