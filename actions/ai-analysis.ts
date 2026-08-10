@@ -2,6 +2,7 @@
 
 import { requireUser } from "@/lib/auth/session";
 import { persistImpactAnalysisForFinding } from "@/lib/db/impact-analyses";
+import { persistProposedFixForFinding } from "@/lib/db/proposed-fixes";
 import { getRepositoryDependencyUsage, type RepositoryUsageContext } from "@/lib/github/dependency-usage";
 import { createDraftPullRequestFromVerifiedChanges, getGitHubRepositoryBaseForCurrentUser, type DraftPullRequestActionResult as GitHubDraftPullRequestActionResult } from "@/lib/github/draft-pull-request";
 import { getProposedFixContext } from "@/lib/github/proposed-fix-context";
@@ -165,6 +166,20 @@ export async function requestProposedFix(input: { owner: string; repository: str
   });
 
   if (proposedFixResult.kind !== "proposal") return proposedFixResult;
+
+  // Persistence is intentionally best-effort. A verified proposal and its signed
+  // validation ticket must remain usable if Neon is temporarily unavailable.
+  await persistProposedFixForFinding({
+    githubRepositoryId: result.repository.githubRepositoryId,
+    baseCommitSha: result.repository.baseCommitSha,
+    dependency: {
+      packageName: dependency.name,
+      dependencyType: dependency.type,
+      declaredVersion: dependency.version,
+      latestVersion,
+    },
+    proposal: proposedFixResult.proposal,
+  });
 
   const validationTicket = createProposedFixValidationTicket({
     userId: user.id,

@@ -152,7 +152,7 @@ model Finding {
   createdAt                DateTime       @default(now())
   scan                     Scan           @relation(fields: [scanId], references: [id], onDelete: Restrict)
   impactAnalysis           ImpactAnalysis?
-  proposedFixes            ProposedFix[]
+  proposedFix              ProposedFix?
 
   @@unique([scanId, packageName, dependencyType])
   @@index([status])
@@ -173,7 +173,7 @@ model ImpactAnalysis {
 
 model ProposedFix {
   id                    String            @id @default(cuid())
-  findingId             String
+  findingId             String            @unique
   status                ProposedFixStatus
   confidence            Int?
   summary               String

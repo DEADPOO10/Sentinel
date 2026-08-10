@@ -1,24 +1,15 @@
 import "server-only";
 
-import type { Prisma } from "@/generated/prisma/client";
-import { requireUser } from "@/lib/auth/session";
+import { getCurrentGitHubUserId, getPersistedFindingIdentity, resolveLatestFindingForCurrentUser, type FindingResolutionStage, type PersistedFindingIdentity } from "@/lib/db/finding-resolution";
 import { getPrismaClient } from "@/lib/db/prisma";
 
-const GITHUB_REPOSITORY_ID_PATTERN = /^(?:0|[1-9]\d{0,18})$/;
-const GIT_SHA_PATTERN = /^[a-f\d]{40,64}$/i;
-const DEPENDENCY_TYPES = new Map([
-  ["dependency", "DEPENDENCY"],
-  ["devDependency", "DEV_DEPENDENCY"],
-  ["peerDependency", "PEER_DEPENDENCY"],
-  ["optionalDependency", "OPTIONAL_DEPENDENCY"],
-] as const);
 const RISK_LEVELS = new Map([
   ["low", "LOW"],
   ["medium", "MEDIUM"],
   ["high", "HIGH"],
 ] as const);
 
-type ImpactPersistenceStage = "membership_verification" | "latest_scan_lookup" | "finding_resolution" | "impact_analysis_upsert";
+type ImpactPersistenceStage = FindingResolutionStage | "impact_analysis_upsert";
 type ImpactPersistenceUnavailableCategory = "invalid_input" | "repository_not_connected" | "latest_scan_unavailable" | "latest_scan_mismatch" | "finding_not_found_or_changed" | "database_error";
 
 export type ImpactAnalysisPersistenceInput = {
@@ -72,9 +63,9 @@ export async function persistImpactAnalysisForFinding(input: ImpactAnalysisPersi
 
       stage = "impact_analysis_upsert";
       const saved = await transaction.impactAnalysis.upsert({
-        where: { findingId: finding.id },
+        where: { findingId: finding.findingId },
         create: {
-          findingId: finding.id,
+          findingId: finding.findingId,
           risk: data.analysis.risk,
           confidence: data.analysis.confidence,
           summary: data.analysis.summary,
@@ -105,7 +96,7 @@ export async function persistImpactAnalysisForFinding(input: ImpactAnalysisPersi
 
 /** Returns a persisted analysis only when its finding belongs to the current user's latest matching scan. */
 export async function getImpactAnalysisForFinding(input: Omit<ImpactAnalysisPersistenceInput, "analysis">): Promise<SavedImpactAnalysis | null> {
-  const data = getFindingIdentity(input);
+  const data = getPersistedFindingIdentity(input);
   if (!data) return null;
 
   const githubUserId = await getCurrentGitHubUserId();
@@ -121,7 +112,7 @@ export async function getImpactAnalysisForFinding(input: Omit<ImpactAnalysisPers
 
       stage = "finding_resolution";
       const analysis = await transaction.impactAnalysis.findUnique({
-        where: { findingId: finding.id },
+        where: { findingId: finding.findingId },
         select: {
           risk: true,
           confidence: true,
@@ -140,15 +131,7 @@ export async function getImpactAnalysisForFinding(input: Omit<ImpactAnalysisPers
   }
 }
 
-type PersistenceData = {
-  githubRepositoryId: string;
-  baseCommitSha: string | null;
-  dependency: {
-    packageName: string;
-    dependencyType: "DEPENDENCY" | "DEV_DEPENDENCY" | "PEER_DEPENDENCY" | "OPTIONAL_DEPENDENCY";
-    declaredVersion: string;
-    latestVersion: string;
-  };
+type PersistenceData = PersistedFindingIdentity & {
   analysis: {
     risk: "LOW" | "MEDIUM" | "HIGH";
     confidence: number;
@@ -159,10 +142,8 @@ type PersistenceData = {
   };
 };
 
-type FindingIdentity = Omit<PersistenceData, "analysis">;
-
 function getPersistenceData(input: ImpactAnalysisPersistenceInput): PersistenceData | null {
-  const identity = getFindingIdentity(input);
+  const identity = getPersistedFindingIdentity(input);
   const risk = RISK_LEVELS.get(input.analysis.risk);
   const confidence = getSafeConfidence(input.analysis.confidence);
   const summary = getSafeText(input.analysis.summary, 1_000);
@@ -175,74 +156,6 @@ function getPersistenceData(input: ImpactAnalysisPersistenceInput): PersistenceD
     ...identity,
     analysis: { risk, confidence, summary, potentialImpact, riskExplanation, recommendedNextStep },
   };
-}
-
-function getFindingIdentity(input: Omit<ImpactAnalysisPersistenceInput, "analysis">): FindingIdentity | null {
-  const githubRepositoryId = getSafeGitHubRepositoryId(input.githubRepositoryId);
-  const baseCommitSha = input.baseCommitSha === null ? null : getSafeGitSha(input.baseCommitSha);
-  const dependencyType = DEPENDENCY_TYPES.get(input.dependency.dependencyType);
-  const packageName = getSafeText(input.dependency.packageName, 214);
-  const declaredVersion = getSafeText(input.dependency.declaredVersion, 256);
-  const latestVersion = getSafeText(input.dependency.latestVersion, 64);
-  if (!githubRepositoryId || !dependencyType || !packageName || !declaredVersion || !latestVersion || (input.baseCommitSha !== null && !baseCommitSha)) return null;
-
-  return {
-    githubRepositoryId,
-    baseCommitSha,
-    dependency: { packageName, dependencyType, declaredVersion, latestVersion },
-  };
-}
-
-async function resolveLatestFindingForCurrentUser(
-  transaction: Prisma.TransactionClient,
-  githubUserId: string,
-  identity: FindingIdentity,
-  setStage: (stage: ImpactPersistenceStage) => void,
-) {
-  setStage("membership_verification");
-  const connection = await transaction.userRepository.findFirst({
-    where: {
-      user: { githubUserId },
-      repository: { githubRepositoryId: identity.githubRepositoryId },
-    },
-    select: { repositoryId: true },
-  });
-  if (!connection) return { kind: "unavailable" as const, category: "repository_not_connected" as const };
-
-  setStage("latest_scan_lookup");
-  const latestScan = await transaction.scan.findFirst({
-    where: {
-      repositoryId: connection.repositoryId,
-      status: "COMPLETED",
-      completedAt: { not: null },
-    },
-    orderBy: [{ completedAt: "desc" }, { createdAt: "desc" }],
-    select: { id: true, baseCommitSha: true },
-  });
-  if (!latestScan) return { kind: "unavailable" as const, category: "latest_scan_unavailable" as const };
-  if (latestScan.baseCommitSha !== identity.baseCommitSha) return { kind: "unavailable" as const, category: "latest_scan_mismatch" as const };
-
-  setStage("finding_resolution");
-  const finding = await transaction.finding.findUnique({
-    where: {
-      scanId_packageName_dependencyType: {
-        scanId: latestScan.id,
-        packageName: identity.dependency.packageName,
-        dependencyType: identity.dependency.dependencyType,
-      },
-    },
-    select: {
-      id: true,
-      declaredVersion: true,
-      latestVersion: true,
-      status: true,
-    },
-  });
-  if (!finding || finding.declaredVersion !== identity.dependency.declaredVersion || finding.latestVersion !== identity.dependency.latestVersion || finding.status !== "UPDATE_AVAILABLE") {
-    return { kind: "unavailable" as const, category: "finding_not_found_or_changed" as const };
-  }
-
-  return finding;
 }
 
 function toSavedImpactAnalysis(analysis: {
@@ -263,20 +176,6 @@ function toSavedImpactAnalysis(analysis: {
     recommendedNextStep: analysis.recommendation,
     createdAt: analysis.createdAt,
   };
-}
-
-async function getCurrentGitHubUserId() {
-  const user = await requireUser();
-  return getSafeText(user.id, 128);
-}
-
-function getSafeGitHubRepositoryId(value: number | string) {
-  const normalized = typeof value === "number" ? String(value) : value;
-  return GITHUB_REPOSITORY_ID_PATTERN.test(normalized) ? normalized : null;
-}
-
-function getSafeGitSha(value: string) {
-  return GIT_SHA_PATTERN.test(value) ? value : null;
 }
 
 function getSafeText(value: unknown, maximumLength: number) {
