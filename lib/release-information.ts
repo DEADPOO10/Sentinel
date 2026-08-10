@@ -3,6 +3,7 @@ import "server-only";
 import semver from "semver";
 import { getGitHubAccessTokenForCurrentUser } from "@/lib/github/repositories";
 import { isValidGitHubRepository } from "@/lib/github/package-json";
+import { getLatestNpmPackageMetadata } from "@/lib/npm/registry";
 import type { ReleaseChangeType } from "@/lib/npm/dependency-versions";
 
 const NPM_REGISTRY_ORIGIN = "https://registry.npmjs.org/";
@@ -15,7 +16,7 @@ export const RELEASE_INFORMATION_LIMITS = {
   maxChangelogBytesFetched: 60_000,
   maxReleaseNoteCharacters: 3_600,
   externalRequestTimeoutMs: 8_000,
-  maxNpmMetadataBytes: 1_000_000,
+  maxNpmHistoricalMetadataBytes: 1_000_000,
   maxGitHubReleaseResponseBytes: 120_000,
 } as const;
 
@@ -51,11 +52,6 @@ type ReleaseInformationInput = {
   latestPublishedAt: string | null;
 };
 
-type NpmMetadata = {
-  repository: GitHubRepositoryReference | null;
-  releases: ReleaseEvidence[];
-};
-
 type GitHubRepositoryReference = { owner: string; repository: string };
 
 export async function getReleaseInformation(input: ReleaseInformationInput): Promise<ReleaseInformationContext> {
@@ -64,8 +60,13 @@ export async function getReleaseInformation(input: ReleaseInformationInput): Pro
   if (!baseVersion || !semver.valid(input.latestVersion) || semver.prerelease(input.latestVersion)) return unavailable;
 
   try {
-    const npmMetadata = await getNpmMetadata(input, baseVersion);
-    if (!npmMetadata) return unavailable;
+    const latestMetadataLookup = await getLatestNpmPackageMetadata(input.packageName);
+    if (!latestMetadataLookup.metadata) return unavailable;
+    const contextInput = {
+      ...input,
+      latestPublishedAt: input.latestPublishedAt ?? latestMetadataLookup.metadata.publishedAt,
+    };
+    const sourceRepository = getGitHubRepositoryReference(latestMetadataLookup.metadata.repository);
 
     let githubToken: string | null = null;
     try {
@@ -74,23 +75,24 @@ export async function getReleaseInformation(input: ReleaseInformationInput): Pro
       logSafeReleaseEvent("release_context_unavailable", { stage: "github_token", category: getFailureCategory(error) });
     }
 
-    if (githubToken && npmMetadata.repository) {
-      const githubReleaseEvidence = await getGitHubReleaseEvidence(npmMetadata.repository, baseVersion, input.latestVersion, githubToken);
-      if (githubReleaseEvidence.some((release) => release.excerpt)) return createAvailableContext(input, baseVersion, "github-releases", githubReleaseEvidence);
+    if (githubToken && sourceRepository) {
+      const githubReleaseEvidence = await getGitHubReleaseEvidence(sourceRepository, baseVersion, input.latestVersion, githubToken);
+      if (githubReleaseEvidence.some((release) => release.excerpt)) return createAvailableContext(contextInput, baseVersion, "github-releases", githubReleaseEvidence);
 
-      const changelogEvidence = await getChangelogEvidence(npmMetadata.repository, baseVersion, input.latestVersion, githubToken);
-      if (changelogEvidence.length > 0) return createAvailableContext(input, baseVersion, "changelog", changelogEvidence);
-      if (githubReleaseEvidence.length > 0) return createAvailableContext(input, baseVersion, "github-releases", githubReleaseEvidence);
+      const changelogEvidence = await getChangelogEvidence(sourceRepository, baseVersion, input.latestVersion, githubToken);
+      if (changelogEvidence.length > 0) return createAvailableContext(contextInput, baseVersion, "changelog", changelogEvidence);
+      if (githubReleaseEvidence.length > 0) return createAvailableContext(contextInput, baseVersion, "github-releases", githubReleaseEvidence);
     }
 
-    return npmMetadata.releases.length > 0 ? createAvailableContext(input, baseVersion, "npm-metadata", npmMetadata.releases) : unavailable;
+    const npmReleaseEvidence = await getNpmReleaseEvidenceFallback(input, baseVersion);
+    return npmReleaseEvidence.length > 0 ? createAvailableContext(contextInput, baseVersion, "npm-metadata", npmReleaseEvidence) : unavailable;
   } catch (error) {
     logSafeReleaseEvent("release_context_unavailable", { stage: "release_information", category: getFailureCategory(error) });
     return unavailable;
   }
 }
 
-async function getNpmMetadata(input: ReleaseInformationInput, baseVersion: string): Promise<NpmMetadata | null> {
+async function getNpmReleaseEvidenceFallback(input: ReleaseInformationInput, baseVersion: string): Promise<ReleaseEvidence[]> {
   try {
     const response = await fetch(new URL(encodeURIComponent(input.packageName), NPM_REGISTRY_ORIGIN), {
       headers: { Accept: "application/json" },
@@ -99,22 +101,19 @@ async function getNpmMetadata(input: ReleaseInformationInput, baseVersion: strin
     });
     if (!response.ok) {
       logSafeReleaseEvent("release_context_unavailable", { stage: "npm_metadata", httpStatus: response.status, httpCategory: getHttpStatusCategory(response.status) });
-      return null;
+      return [];
     }
 
-    const metadata = parseJson(await readBoundedText(response, RELEASE_INFORMATION_LIMITS.maxNpmMetadataBytes));
+    const metadata = parseJson(await readBoundedText(response, RELEASE_INFORMATION_LIMITS.maxNpmHistoricalMetadataBytes));
     if (!isRecord(metadata)) {
       logSafeReleaseEvent("release_context_unavailable", { stage: "npm_metadata_parse" });
-      return null;
+      return [];
     }
 
-    return {
-      repository: getGitHubRepositoryReference(metadata.repository),
-      releases: getNpmReleaseEvidence(metadata, baseVersion, input.latestVersion),
-    };
+    return getNpmReleaseEvidence(metadata, baseVersion, input.latestVersion);
   } catch (error) {
     logSafeReleaseEvent("release_context_unavailable", { stage: "npm_metadata", category: getFailureCategory(error) });
-    return null;
+    return [];
   }
 }
 
@@ -246,12 +245,17 @@ function createAvailableContext(input: ReleaseInformationInput, baseVersion: str
     baseVersion,
     latestVersion: input.latestVersion,
     changeType: input.changeType,
-    latestPublishedAt: input.latestPublishedAt,
+    latestPublishedAt: input.latestPublishedAt ?? getLatestEvidencePublishedAt(evidence, input.latestVersion),
     releasesExamined: evidence.length,
     breakingChangeIndicators: evidence.filter((release) => release.hasBreakingChangeIndicator).length,
     migrationIndicators: evidence.filter((release) => release.hasMigrationIndicator).length,
     evidence,
   };
+}
+
+function getLatestEvidencePublishedAt(evidence: ReleaseEvidence[], latestVersion: string) {
+  const latestEvidence = evidence.find((release) => release.tag !== null && semver.valid(release.tag) === latestVersion);
+  return latestEvidence?.publishedAt ?? null;
 }
 
 function createUnavailableContext(input: ReleaseInformationInput, baseVersion: string | null): ReleaseInformationContext {

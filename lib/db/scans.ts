@@ -8,6 +8,12 @@ import type { CheckedPackageDependency } from "@/lib/npm/dependency-versions";
 const SCAN_IDEMPOTENCY_WINDOW_MS = 60_000;
 const RECENT_SCAN_LIMIT = 10;
 const MAX_FINDINGS_PER_SCAN = 5_000;
+// Prisma defaults interactive transactions to a 2s acquisition window and a
+// 5s lifetime. A cold or briefly contended database connection can exceed
+// those limits before the first membership query begins, producing P2028.
+// Keep the transaction bounded while giving this short persistence operation
+// enough time to acquire a connection and atomically verify ownership.
+const SCAN_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 15_000 } as const;
 const GITHUB_REPOSITORY_ID_PATTERN = /^(?:0|[1-9]\d{0,18})$/;
 const GIT_SHA_PATTERN = /^[a-f\d]{40,64}$/i;
 const DEPENDENCY_TYPES = new Map([
@@ -164,7 +170,7 @@ export async function createCompletedScanWithFindings(input: CompletedScanInput)
 
       stage = "transaction_commit";
       return { kind: "created", scanId: createdScan.id };
-    });
+    }, SCAN_TRANSACTION_OPTIONS);
   } catch (error) {
     if (isUniqueConstraintError(error) && client && scan && githubUserId) {
       stage = "scan_reuse_lookup";

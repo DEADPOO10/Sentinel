@@ -1,7 +1,7 @@
 import semver from "semver";
 import type { PackageDependency, PackageManifest } from "@/lib/github/package-json";
+import { getLatestNpmPackageMetadata } from "@/lib/npm/registry";
 
-const NPM_REGISTRY_ORIGIN = "https://registry.npmjs.org/";
 const MAX_CONCURRENT_REQUESTS = 8;
 
 export type DependencyStatus = "up-to-date" | "update-available" | "ahead-of-npm-latest" | "unknown";
@@ -32,8 +32,10 @@ export type CheckedPackageManifest = Omit<PackageManifest, "dependencies"> & {
 };
 
 export async function checkDependencyVersions(manifest: PackageManifest): Promise<CheckedPackageManifest> {
+  const startedAt = Date.now();
   const packageNames = [...new Set(manifest.dependencies.filter((dependency) => isSupportedSemverRange(dependency.version)).map((dependency) => dependency.name))];
-  const releases = new Map(await mapWithConcurrency(packageNames, MAX_CONCURRENT_REQUESTS, async (packageName) => [packageName, await getLatestStableRelease(packageName)] as const));
+  const releaseLookups = await mapWithConcurrency(packageNames, MAX_CONCURRENT_REQUESTS, async (packageName) => [packageName, await getLatestNpmPackageMetadata(packageName)] as const);
+  const releases = new Map(releaseLookups.map(([packageName, lookup]) => [packageName, lookup.metadata] as const));
   const dependencies = manifest.dependencies.map((dependency) => checkDependency(dependency, releases.get(dependency.name) ?? null));
   const summary = dependencies.reduce((counts, dependency) => {
     if (dependency.status === "up-to-date") counts.upToDate += 1;
@@ -46,6 +48,14 @@ export async function checkDependencyVersions(manifest: PackageManifest): Promis
     if (dependency.risk === "high") counts.highRiskUpdates += 1;
     return counts;
   }, { total: dependencies.length, upToDate: 0, updatesAvailable: 0, aheadOfNpmLatest: 0, unknown: 0, majorUpdates: 0, minorUpdates: 0, patchUpdates: 0, highRiskUpdates: 0 });
+
+  logVersionIntelligenceDiagnostics({
+    dependencyCount: manifest.dependencies.length,
+    supportedPackageCount: packageNames.length,
+    npmRequests: releaseLookups.filter(([, lookup]) => lookup.source === "network").length,
+    cacheHits: releaseLookups.filter(([, lookup]) => lookup.source !== "network").length,
+    durationMs: Date.now() - startedAt,
+  });
 
   return { ...manifest, dependencies, summary };
 }
@@ -102,45 +112,16 @@ function isSupportedSemverRange(version: string) {
 
 type NpmRelease = { latestVersion: string; publishedAt: string | null };
 
-async function getLatestStableRelease(packageName: string): Promise<NpmRelease | null> {
-  try {
-    const response = await fetch(new URL(encodeURIComponent(packageName), NPM_REGISTRY_ORIGIN), {
-      headers: { Accept: "application/json" },
-      next: { revalidate: 3600 },
-    });
-    if (!response.ok) return null;
-
-    const metadata: unknown = await response.json();
-    const latestVersion = getLatestDistTag(metadata);
-    if (!latestVersion || semver.prerelease(latestVersion)) return null;
-
-    const stableVersion = semver.valid(latestVersion);
-    if (!stableVersion) return null;
-
-    return { latestVersion: stableVersion, publishedAt: getPublishedAt(metadata, latestVersion) };
-  } catch {
-    return null;
+function logVersionIntelligenceDiagnostics(details: {
+  dependencyCount: number;
+  supportedPackageCount: number;
+  npmRequests: number;
+  cacheHits: number;
+  durationMs: number;
+}) {
+  if (process.env.NODE_ENV !== "production") {
+    console.info("[sentinel:npm] version_intelligence_completed", details);
   }
-}
-
-function getLatestDistTag(metadata: unknown) {
-  if (!isRecord(metadata)) return null;
-
-  const distTags = metadata["dist-tags"];
-  if (!isRecord(distTags)) return null;
-
-  return typeof distTags.latest === "string" ? distTags.latest : null;
-}
-
-function getPublishedAt(metadata: unknown, version: string) {
-  if (!isRecord(metadata) || !isRecord(metadata.time)) return null;
-
-  const publishedAt = metadata.time[version];
-  return typeof publishedAt === "string" && Number.isFinite(Date.parse(publishedAt)) ? publishedAt : null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function mapWithConcurrency<T, Result>(items: T[], concurrency: number, mapper: (item: T) => Promise<Result>) {
