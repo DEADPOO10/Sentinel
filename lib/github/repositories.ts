@@ -1,5 +1,6 @@
 import { headers } from "next/headers";
 import { getToken } from "next-auth/jwt";
+import { cache } from "react";
 
 export type GitHubRepository = {
   id: number;
@@ -28,6 +29,7 @@ type VerifiedGitHubRepositoryResult = { kind: "ready"; repository: VerifiedGitHu
 const GITHUB_OWNER_PATTERN = /^[A-Za-z\d](?:[A-Za-z\d]|-(?=[A-Za-z\d])){0,38}$/;
 const GITHUB_REPOSITORY_PATTERN = /^[A-Za-z\d][A-Za-z\d._-]{0,99}$/;
 const GIT_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/;
+const GITHUB_REQUEST_TIMEOUT_MS = 8_000;
 
 class GitHubApiError extends Error {
   constructor(public readonly status: number) {
@@ -66,6 +68,7 @@ export async function getVerifiedGitHubRepositoryForCurrentUser(owner: string, r
     const response = await fetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}`, {
       headers: getGitHubHeaders(accessToken),
       cache: "no-store",
+      signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
     });
 
     if (response.status === 404) {
@@ -84,7 +87,7 @@ export async function getVerifiedGitHubRepositoryForCurrentUser(owner: string, r
   }
 }
 
-export async function getGitHubAccessTokenForCurrentUser() {
+export const getGitHubAccessTokenForCurrentUser = cache(async function getGitHubAccessTokenForCurrentUser() {
   const secret = process.env.AUTH_SECRET ?? process.env.NEXTAUTH_SECRET;
   if (!secret) return null;
 
@@ -96,7 +99,7 @@ export async function getGitHubAccessTokenForCurrentUser() {
   });
 
   return typeof token?.githubAccessToken === "string" ? token.githubAccessToken : null;
-}
+});
 
 async function fetchGitHubRepositories(accessToken: string) {
   const repositories: GitHubRepository[] = [];
@@ -106,6 +109,7 @@ async function fetchGitHubRepositories(accessToken: string) {
     const response = await fetch(nextPage, {
       headers: getGitHubHeaders(accessToken),
       cache: "no-store",
+      signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
     });
 
     if (!response.ok) throw new GitHubApiError(response.status);

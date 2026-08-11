@@ -5,10 +5,13 @@ import semver from "semver";
 const NPM_REGISTRY_ORIGIN = "https://registry.npmjs.org/";
 
 export const NPM_REGISTRY_LIMITS = {
-  requestTimeoutMs: 8_000,
+  // A missing version hint is preferable to holding the page for one stalled
+  // registry request. The result is shown as "Unknown" and is retried later.
+  requestTimeoutMs: 3_500,
   maxLatestMetadataBytes: 256_000,
-  cacheTtlMs: 5 * 60_000,
-  maxCacheEntries: 200,
+  cacheTtlMs: 15 * 60_000,
+  revalidateSeconds: 15 * 60,
+  maxCacheEntries: 400,
 } as const;
 
 export type NpmLatestPackageMetadata = {
@@ -68,7 +71,12 @@ async function fetchLatestMetadata(packageName: string): Promise<NpmLatestPackag
     // tag and returns one version document instead of a complete packument.
     const response = await fetch(new URL(`${encodeURIComponent(packageName)}/latest`, NPM_REGISTRY_ORIGIN), {
       headers: { Accept: "application/json" },
-      cache: "no-store",
+      // npm metadata is public and changes infrequently. Next's persistent
+      // data cache makes warm requests fast even when a new server instance
+      // handles the page, while the small process cache coalesces in-flight
+      // work and avoids repeat parsing within the same instance.
+      cache: "force-cache",
+      next: { revalidate: NPM_REGISTRY_LIMITS.revalidateSeconds },
       signal: AbortSignal.timeout(NPM_REGISTRY_LIMITS.requestTimeoutMs),
     });
     if (!response.ok) return null;

@@ -2,7 +2,9 @@ import semver from "semver";
 import type { PackageDependency, PackageManifest } from "@/lib/github/package-json";
 import { getLatestNpmPackageMetadata } from "@/lib/npm/registry";
 
-const MAX_CONCURRENT_REQUESTS = 8;
+// This keeps registry pressure bounded while shortening the worst-case queue
+// for projects with many dependencies.
+const MAX_CONCURRENT_REQUESTS = 10;
 
 export type DependencyStatus = "up-to-date" | "update-available" | "ahead-of-npm-latest" | "unknown";
 export type ReleaseChangeType = "major" | "minor" | "patch";

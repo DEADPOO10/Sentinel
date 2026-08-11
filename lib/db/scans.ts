@@ -223,6 +223,41 @@ export async function getLatestRepositoryScan(githubRepositoryId: number | strin
   });
 }
 
+/**
+ * Returns the complete latest successful snapshot for the connected user.
+ * This is deliberately a database-only read: callers must verify GitHub access
+ * for the current request before using it to render a repository page.
+ */
+export async function getLatestRepositoryScanWithFindings(githubRepositoryId: number | string) {
+  const repository = await getConnectedRepositoryForCurrentUser(githubRepositoryId);
+  if (!repository) return null;
+
+  return getPrismaClient().scan.findFirst({
+    where: { repositoryId: repository.id, status: "COMPLETED", completedAt: { not: null } },
+    orderBy: [{ completedAt: "desc" }, { createdAt: "desc" }],
+    select: {
+      id: true,
+      baseCommitSha: true,
+      dependencyCount: true,
+      updatesAvailable: true,
+      highRiskCount: true,
+      completedAt: true,
+      findings: {
+        orderBy: [{ packageName: "asc" }, { dependencyType: "asc" }],
+        select: {
+          packageName: true,
+          dependencyType: true,
+          declaredVersion: true,
+          latestVersion: true,
+          changeType: true,
+          risk: true,
+          status: true,
+        },
+      },
+    },
+  });
+}
+
 /** Returns up to ten recent completed scans for repositories connected to the current user. */
 export async function listRecentRepositoryScans(limit = 5) {
   const githubUserId = await getCurrentGithubUserId();
