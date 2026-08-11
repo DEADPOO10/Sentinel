@@ -1,12 +1,35 @@
 @import "tailwindcss";
 
 @theme inline {
-  --font-sans: "Geist", "Geist Fallback", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "Geist Mono", "Geist Mono Fallback", ui-monospace, monospace;
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
 }
 
-:root { --background: #fffdf8; --foreground: #111827; }
+:root {
+  --paper: #f5f5ef;
+  --paper-soft: #ecece5;
+  --ink: #171817;
+  --ink-soft: #292a28;
+  --line: #d5d6ce;
+  --muted: #696b66;
+  --acid: #d8ff42;
+  --success: #237a53;
+  --warning: #a85f16;
+  --danger: #a4362a;
+  --background: var(--paper);
+  --foreground: var(--ink);
+}
+
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body { background: var(--background); color: var(--foreground); font-family: var(--font-geist-sans), Arial, sans-serif; }
-::selection { background: #fef3c7; color: #92400e; }
+::selection { background: var(--acid); color: var(--ink); }
+
+.sentinel-page { min-height: 100vh; background: var(--paper); color: var(--ink); }
+.eyebrow { font-family: var(--font-geist-mono), monospace; font-size: .7rem; font-weight: 500; letter-spacing: .16em; color: var(--muted); }
+.editorial-title { font-weight: 500; letter-spacing: -.055em; line-height: .98; }
+.tech-panel { background: var(--ink); color: #f6f6f0; border: 1px solid var(--ink); }
+.quiet-link { color: var(--muted); transition: color .15s ease; }
+.quiet-link:hover { color: var(--ink); }
+.data-table tbody tr { transition: background-color .15s ease; }
+.data-table tbody tr:hover { background: var(--paper-soft); }

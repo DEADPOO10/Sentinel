@@ -2,11 +2,4 @@ import { redirect } from "next/navigation";
 import { auth } from "@/auth";
 import { SignInWithGitHubButton } from "@/components/auth-buttons";
 import { SiteNavigation } from "@/components/site-navigation";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-
-export default async function LoginPage() {
-  const session = await auth();
-  if (session?.user) redirect("/dashboard");
-
-  return <main className="min-h-screen bg-[#fffdf8] text-[#111827]"><SiteNavigation /><section className="mx-auto flex min-h-[calc(100vh-5rem)] max-w-7xl items-center justify-center px-6 py-16"><Card className="w-full max-w-md"><CardHeader><p className="font-mono text-xs tracking-[.16em] text-[#b45309]">SENTINEL</p><CardTitle className="mt-2 text-2xl">Welcome back</CardTitle><CardDescription>Connect your GitHub account to start monitoring your repositories.</CardDescription></CardHeader><CardContent><SignInWithGitHubButton /></CardContent></Card></section></main>;
-}
+export default async function LoginPage() { const session = await auth(); if (session?.user) redirect("/dashboard"); return <main className="sentinel-page"><SiteNavigation /><section className="mx-auto grid min-h-[calc(100vh-4rem)] max-w-7xl items-stretch lg:grid-cols-[1fr_.9fr]"><div className="flex items-center px-6 py-16 lg:px-8"><div className="max-w-xl"><p className="eyebrow">SENTINEL / ACCESS</p><h1 className="editorial-title mt-5 text-5xl sm:text-7xl">Software keeps changing.</h1><p className="mt-7 max-w-md text-lg leading-8 text-[#696b66]">Connect GitHub to see the maintenance work waiting in your repositories.</p></div></div><div className="tech-panel flex items-center px-6 py-16 lg:px-12"><div className="w-full max-w-sm"><p className="font-mono text-xs tracking-[.16em] text-[#d8ff42]">GITHUB / SIGN IN</p><h2 className="mt-5 text-3xl font-medium tracking-[-.04em]">Start with the code you already maintain.</h2><p className="mt-4 text-sm leading-6 text-[#b9bcb4]">Sentinel reads repository access from your GitHub connection. Nothing is changed without your review.</p><div className="mt-9"><SignInWithGitHubButton /></div></div></div></section></main>; }

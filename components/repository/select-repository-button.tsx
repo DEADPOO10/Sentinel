@@ -23,5 +23,5 @@ export function SelectRepositoryButton({ owner, repositoryName }: { owner: strin
     });
   }
 
-  return <div className="flex flex-col items-start gap-2 sm:items-end"><Button type="button" size="sm" onClick={selectRepository} disabled={isPending} aria-label={`Select ${owner}/${repositoryName}`}>{isPending ? "Saving repository…" : "Select repository"}</Button>{error ? <p className="max-w-64 text-xs text-[#b45309]" role="alert">{error}</p> : null}</div>;
+  return <div className="flex flex-col items-start gap-2 sm:items-end"><Button type="button" size="sm" onClick={selectRepository} disabled={isPending} aria-label={`Select ${owner}/${repositoryName}`}>{isPending ? "Saving repository…" : "Select repository"}</Button>{error ? <p className="max-w-64 text-xs text-[#343633]" role="alert">{error}</p> : null}</div>;
 }

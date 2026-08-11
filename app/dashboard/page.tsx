@@ -5,32 +5,8 @@ import { listRecentMaintenanceActivityForCurrentUser } from "@/lib/db/maintenanc
 import { getDashboardMaintenanceMetricsForCurrentUser, type DashboardMaintenanceMetrics } from "@/lib/db/scans";
 import { MaintenanceActivitySection } from "@/components/maintenance-activity";
 import { SiteNavigation } from "@/components/site-navigation";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
-export default async function DashboardPage() {
-  const user = await requireUser();
-  const username = user.username ?? user.name ?? "GitHub user";
-  const [metrics, activity] = await Promise.all([getDashboardMetrics(), getDashboardActivity()]);
-
-  return <main className="min-h-screen bg-[#fffdf8] text-[#111827]"><SiteNavigation /><section className="mx-auto max-w-7xl px-6 py-14 lg:px-8 lg:py-20"><p className="font-mono text-xs tracking-[.16em] text-[#b45309]">DASHBOARD</p><h1 className="mt-3 text-3xl font-medium tracking-[-.04em] sm:text-4xl">Welcome, {username}</h1><p className="mt-3 max-w-xl text-[#4b5563]">Your Sentinel workspace is ready.</p><div className="mt-12 grid gap-5 sm:grid-cols-3"><DashboardMetricCard icon={<GitBranch className="h-5 w-5 text-[#b45309]" />} title="Repositories" value={metrics === null ? "Unavailable" : `${metrics.connectedRepositories} connected`} description={metrics === null ? "Sentinel could not load your saved repository connections right now." : "Repositories you select from GitHub are saved here."} /><DashboardMetricCard icon={<ArrowUpRight className="h-5 w-5 text-[#b45309]" />} title="Updates available" value={metrics === null ? "Unavailable" : String(metrics.updatesAvailable)} description="From the latest completed scan for each connected repository." /><DashboardMetricCard icon={<ShieldAlert className="h-5 w-5 text-[#b45309]" />} title="High-risk updates" value={metrics === null ? "Unavailable" : String(metrics.highRiskUpdates)} description="Major dependency updates from those latest scans." /></div><div className="mt-8"><MaintenanceActivitySection title="Recent maintenance activity" description="Your newest persisted Sentinel work across connected repositories." activities={activity} /></div></section></main>;
-}
-
-function DashboardMetricCard({ icon, title, value, description }: { icon: ReactNode; title: string; value: string; description: string }) {
-  return <Card><CardHeader>{icon}<CardTitle className="mt-5 text-3xl">{title}</CardTitle><CardDescription className="text-base">{value}</CardDescription></CardHeader><CardContent><p className="text-sm text-[#6b7280]">{description}</p></CardContent></Card>;
-}
-
-async function getDashboardMetrics(): Promise<DashboardMaintenanceMetrics | null> {
-  try {
-    return await getDashboardMaintenanceMetricsForCurrentUser();
-  } catch {
-    return null;
-  }
-}
-
-async function getDashboardActivity() {
-  try {
-    return await listRecentMaintenanceActivityForCurrentUser();
-  } catch {
-    return [];
-  }
-}
+export default async function DashboardPage() { const user = await requireUser(); const username = user.username ?? user.name ?? "GitHub user"; const [metrics, activity] = await Promise.all([getDashboardMetrics(), getDashboardActivity()]); return <main className="sentinel-page"><SiteNavigation /><section className="mx-auto max-w-7xl px-6 py-14 lg:px-8 lg:py-20"><p className="eyebrow">MAINTENANCE / TODAY</p><div className="mt-4 flex flex-col justify-between gap-8 border-b border-[#171817] pb-10 sm:flex-row sm:items-end"><div><h1 className="editorial-title text-4xl sm:text-6xl">Good to see you,<br />{username}.</h1><p className="mt-5 max-w-xl text-base leading-7 text-[#696b66]">A focused view of the upstream changes Sentinel is keeping under watch.</p></div><p className="max-w-48 font-mono text-xs leading-5 text-[#696b66]">HUMAN REVIEW REMAINS REQUIRED FOR EVERY CHANGE.</p></div><div className="mt-10 grid divide-y divide-[#d5d6ce] border-y border-[#d5d6ce] sm:grid-cols-3 sm:divide-x sm:divide-y-0"><Metric icon={<GitBranch />} title="Connected repositories" value={metrics === null ? "—" : String(metrics.connectedRepositories)} detail="Saved GitHub connections" /><Metric icon={<ArrowUpRight />} title="Updates available" value={metrics === null ? "—" : String(metrics.updatesAvailable)} detail="From the latest scans" /><Metric icon={<ShieldAlert />} title="High-risk updates" value={metrics === null ? "—" : String(metrics.highRiskUpdates)} detail="Major version changes" /></div><div className="mt-12"><MaintenanceActivitySection title="Maintenance activity" description="Your newest persisted Sentinel work across connected repositories." activities={activity} /></div></section></main>; }
+function Metric({ icon, title, value, detail }: { icon: ReactNode; title: string; value: string; detail: string }) { return <article className="p-6 first:pl-0 sm:first:pr-6 sm:last:pr-0"><div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[.1em] text-[#696b66]"><span className="text-[#171817]">{icon}</span>{title}</div><p className="mt-8 text-5xl font-medium tracking-[-.07em] text-[#171817]">{value}</p><p className="mt-2 text-sm text-[#696b66]">{detail}</p></article>; }
+async function getDashboardMetrics(): Promise<DashboardMaintenanceMetrics | null> { try { return await getDashboardMaintenanceMetricsForCurrentUser(); } catch { return null; } }
+async function getDashboardActivity() { try { return await listRecentMaintenanceActivityForCurrentUser(); } catch { return []; } }
