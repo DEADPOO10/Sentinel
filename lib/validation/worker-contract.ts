@@ -36,9 +36,14 @@ export function isSafeArchiveEntryPath(value: string) {
 
 export function verifyWorkerMessageSignature(secret: string, payload: string, signature: string) {
   if (!/^[A-Za-z0-9_-]{43}$/.test(signature)) return false;
-  const expected = Buffer.from(createHmac("sha256", secret).update(payload).digest("base64url"));
+  const expected = Buffer.from(signWorkerMessageSignature(secret, payload));
   const actual = Buffer.from(signature);
   return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+/** Signs the exact UTF-8 JSON text sent over the validation worker boundary. */
+export function signWorkerMessageSignature(secret: string, payload: string) {
+  return createHmac("sha256", secret).update(payload).digest("base64url");
 }
 
 export function isSafeWorkerResult(value: unknown): value is ValidationWorkerResult {

@@ -1,0 +1,5 @@
+# Kept separate from the Next.js application. Deploy with Python 3.12+.
+# 1.2.x cannot change a Sandbox from registry-only egress to no egress, so it
+# is intentionally not supported by this worker.
+modal>=1.4.0,<2
+fastapi[standard]>=0.115,<1
