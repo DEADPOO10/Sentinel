@@ -67,7 +67,9 @@ Before enabling validation in production, replace host execution with a dedicate
 
 ## Draft PR guard
 
-Draft PR creation remains off unless `SENTINEL_PR_CREATION_ENABLED=true` is deliberately configured. It requires the signed analysis/proposal/validation workflow, revalidates repository write access and the base commit, creates a new `sentinel/` branch, and creates a draft PR only. It never writes the default branch, auto-merges, or runs in the background.
+Draft PR creation remains off unless `SENTINEL_PR_CREATION_ENABLED=true` is deliberately configured. It requires the signed analysis/proposal/completed-validation workflow and accepts only PASSED validation or an explicitly safe PARTIAL result caused by missing optional checks. FAILED, UNABLE_TO_VALIDATE, timed-out, and cleanup-uncertain results are ineligible. Sentinel revalidates repository write access and the exact default-branch commit immediately before creating a branch and again before creating the PR.
+
+V1 constructs one exact `package.json` dependency-range edit from server-revalidated fields. AI-proposed source-file edits are never committed. If the validated repository has a supported root lockfile, creation fails closed until the isolated worker can return that exact authenticated, bounded lockfile artifact; Sentinel does not create a stale package.json-only PR. Eligible no-lockfile repositories use `sentinel/deps/<sanitized-dependency>/<proposal-id>` and always create a GitHub Draft. Sentinel never writes the default branch, marks a PR ready for review, auto-merges, or runs PR creation in the background.
 
 PR request deduplication in memory is only an optimization. Cross-instance duplicate prevention uses a deterministic branch name derived from the signed proposal identity, GitHub's unique branch reference constraint, and the PR change marker lookup. If another instance already reserved the proposal's branch, Sentinel safely asks the user to refresh rather than creating a second PR.
 

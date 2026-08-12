@@ -1,6 +1,17 @@
 import "server-only";
 
-import { createHash } from "node:crypto";
+import {
+  createDraftPrBranchPayload,
+  createDraftPullRequestPayload,
+  createSentinelBranchName,
+  getAuthorizedDraftPrChangeFailure,
+  getDraftPrCommitMessage,
+  isDraftPullRequestCreationEnabled,
+  isMatchingSentinelPullRequest,
+  isValidatedRepositoryHeadCurrent,
+  updateAuthorizedPackageJson,
+  type DraftPrPublicErrorCategory,
+} from "@/lib/github/draft-pull-request-policy";
 import { getGitHubAccessTokenForCurrentUser } from "@/lib/github/repositories";
 import { isValidGitHubRepository } from "@/lib/github/package-json";
 import type { ImpactAnalysisSnapshot } from "@/lib/impact-analysis-ticket";
@@ -9,13 +20,9 @@ import type { ProposedFixValidationResult } from "@/lib/validation/proposed-fix-
 
 const GITHUB_API_ORIGIN = "https://api.github.com/";
 const GITHUB_API_VERSION = "2026-03-10";
-const SOURCE_EXTENSIONS = new Set(["js", "jsx", "ts", "tsx", "mjs", "cjs"]);
-const EXCLUDED_DIRECTORY_NAMES = new Set(["node_modules", ".next", "dist", "build", "coverage", "vendor", "vendors", "generated", "__generated__"]);
-const PROHIBITED_FILE_NAMES = new Set(["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb", ".npmrc", ".yarnrc", ".yarnrc.yml", ".pypirc", "credentials", "credentials.json", "secrets", "secrets.json", "id_rsa"]);
-
 export const DRAFT_PULL_REQUEST_LIMITS = {
   requestTimeoutMs: 15_000,
-  maxFiles: 4,
+  maxFiles: 1,
   maxSourceFileBytes: 128 * 1024,
   maxCombinedFileBytes: 256 * 1024,
   maxTreeResponseBytes: 8 * 1024 * 1024,
@@ -24,7 +31,7 @@ export const DRAFT_PULL_REQUEST_LIMITS = {
 } as const;
 
 type GitHubHttpCategory = "rate_limited" | "server_error" | "client_error";
-type DraftPullRequestFailureCategory = "github_authorization" | "repository_access" | "write_access" | "repository_restricted" | "stale_base" | "dependency_changed" | "base_commit_unavailable" | "tree_unavailable" | "change_verification" | "prohibited_file" | "github_api" | "timeout" | "request_error" | "branch_creation" | "pull_request_creation";
+type DraftPullRequestFailureCategory = "github_authorization" | "repository_access" | "write_access" | "repository_restricted" | "stale_base" | "dependency_changed" | "base_commit_unavailable" | "tree_unavailable" | "change_verification" | "prohibited_file" | "lockfile_artifact_required" | "source_changes_not_allowed" | "github_api" | "timeout" | "request_error" | "branch_creation" | "pull_request_creation";
 type TreeEntry = { path: string; mode: "100644" | "100755"; type: "blob"; size: number | null };
 type VerifiedFileChange = { path: string; mode: "100644" | "100755"; content: string };
 
@@ -65,7 +72,7 @@ export type DraftPullRequestActionResult =
     declaredVersion: string;
     targetVersion: string;
   }
-  | { kind: "error"; error: string };
+  | { kind: "error"; category: DraftPrPublicErrorCategory; error: string };
 
 type ExistingDraftPullRequestResult = {
   kind: "existing";
@@ -124,12 +131,12 @@ export async function getGitHubRepositoryBaseForCurrentUser(owner: string, repos
 }
 
 export async function createDraftPullRequestFromVerifiedChanges(input: VerifiedDraftPullRequestInput): Promise<DraftPullRequestActionResult> {
-  if (process.env.SENTINEL_PR_CREATION_ENABLED !== "true") {
-    return { kind: "error", error: "Draft pull request creation is disabled in this environment." };
+  if (!isDraftPullRequestCreationEnabled(process.env.SENTINEL_PR_CREATION_ENABLED)) {
+    return draftPrError("pr_creation_disabled", "Draft pull request creation is disabled in this environment.");
   }
 
   const accessToken = await getGitHubAccessTokenForCurrentUser();
-  if (!accessToken) return { kind: "error", error: "GitHub authorization is unavailable. Reconnect GitHub and try again." };
+  if (!accessToken) return draftPrError("github_write_permission_required", "GitHub authorization is unavailable. Reconnect GitHub and try again.");
 
   let createdBranch: string | null = null;
   let potentiallyCreatedBranch: string | null = null;
@@ -159,6 +166,13 @@ export async function createDraftPullRequestFromVerifiedChanges(input: VerifiedD
     const treeSha = await createTree(input, baseCommit.treeSha, treeEntries, accessToken);
     createdCommitSha = await createCommit(input, treeSha, accessToken);
     logSafePrEvent("commit_created", { commitSha: createdCommitSha });
+
+    // Creating Git objects does not modify a branch. Re-check the default HEAD
+    // immediately before the first ref write so a moved repository fails closed.
+    const preBranchRepositoryBase = await getGitHubRepositoryBase(input.owner, input.repository, accessToken, true);
+    if (!matchesValidatedBase(preBranchRepositoryBase, input)) {
+      throw new DraftPullRequestError("stale_base", "pre_branch");
+    }
 
     createdBranch = await createSentinelProposalBranch(input, createdCommitSha, accessToken, (branchName) => {
       potentiallyCreatedBranch = branchName;
@@ -201,7 +215,7 @@ export async function createDraftPullRequestFromVerifiedChanges(input: VerifiedD
         stage: "branch_creation",
         lookup: existingLookup.kind,
       });
-      return { kind: "error", error: "A draft PR for this validated proposal is already being prepared. Refresh shortly before trying again." };
+      return draftPrError("branch_conflict", "A draft PR for this validated proposal is already being prepared. Refresh shortly before trying again.");
     }
     if (pullRequestCreationAttempted && isAmbiguousPullRequestCreationError(error)) {
       const existingLookup = await findExistingDraftPullRequestSafely(input, accessToken);
@@ -218,17 +232,6 @@ export async function createDraftPullRequestFromVerifiedChanges(input: VerifiedD
     if (!cleanupSucceeded && cleanupBranch) return branchCleanupFailureResult(cleanupBranch);
     return getDraftPullRequestErrorResult(error);
   }
-}
-
-export function getProposedChangeIdentifier(input: Pick<VerifiedDraftPullRequestInput, "owner" | "repository" | "baseCommitSha" | "dependency" | "proposedFix">) {
-  return createHash("sha256").update(JSON.stringify({
-    owner: input.owner.toLowerCase(),
-    repository: input.repository.toLowerCase(),
-    baseCommitSha: input.baseCommitSha,
-    dependencyName: input.dependency.name,
-    targetVersion: input.dependency.latestVersion,
-    proposedFix: input.proposedFix,
-  })).digest("base64url").slice(0, 32);
 }
 
 async function getGitHubRepositoryBase(owner: string, repository: string, accessToken: string, requireWriteAccess: boolean): Promise<GitHubRepositoryBase> {
@@ -269,6 +272,14 @@ async function getBaseTree(input: VerifiedDraftPullRequestInput, treeSha: string
 }
 
 async function reconstructVerifiedChanges(input: VerifiedDraftPullRequestInput, baseTree: Map<string, TreeEntry>, accessToken: string) {
+  const policyFailure = getAuthorizedDraftPrChangeFailure(input.proposedFix, baseTree.keys());
+  if (policyFailure) {
+    throw new DraftPullRequestError(
+      policyFailure === "package_json_change_required" ? "change_verification" : policyFailure,
+      "authorized_change_policy",
+    );
+  }
+
   const changes: VerifiedFileChange[] = [];
   const paths = new Set<string>();
   let combinedBytes = 0;
@@ -295,16 +306,11 @@ async function reconstructVerifiedChanges(input: VerifiedDraftPullRequestInput, 
     changes.push({ path, mode: entry.mode, content: updatedContent });
   };
 
-  if (input.proposedFix.packageJsonChange.required) {
-    await addVerifiedFile("package.json", (content) => updateVerifiedPackageJson(content, input));
-  }
-
-  for (const file of input.proposedFix.files) {
-    if (!isAllowedSourceFilePath(file.path)) {
-      throw new DraftPullRequestError("prohibited_file", "source_path");
-    }
-    await addVerifiedFile(file.path, (content) => replaceExactVerifiedSnippet(content, file.originalSnippet, file.proposedSnippet));
-  }
+  await addVerifiedFile("package.json", (content) => updateAuthorizedPackageJson(
+    content,
+    input.dependency,
+    input.proposedFix.packageJsonChange,
+  ));
 
   return changes;
 }
@@ -342,7 +348,7 @@ async function createTree(input: VerifiedDraftPullRequestInput, baseTreeSha: str
 
 async function createCommit(input: VerifiedDraftPullRequestInput, treeSha: string, accessToken: string) {
   const response = await requestGitHub(input.owner, input.repository, accessToken, "POST", `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/commits`, "create_commit", {
-    message: getCommitMessage(input.dependency.name, input.dependency.latestVersion),
+    message: getDraftPrCommitMessage(input.dependency.name, input.dependency.latestVersion),
     tree: treeSha,
     parents: [input.baseCommitSha],
   });
@@ -352,14 +358,19 @@ async function createCommit(input: VerifiedDraftPullRequestInput, treeSha: strin
 }
 
 async function createSentinelProposalBranch(input: VerifiedDraftPullRequestInput, commitSha: string, accessToken: string, onPotentiallyCreatedBranch: (branchName: string) => void) {
-  const branchName = createSentinelBranchName(input.dependency.name, input.dependency.latestVersion, input.proposedChangeIdentifier);
+  const branchName = createSentinelBranchName(input.dependency.name, input.proposedChangeIdentifier);
   if (branchName === input.defaultBranch) throw new DraftPullRequestError("branch_creation", "invalid_branch_name");
 
   try {
-    const response = await requestGitHub(input.owner, input.repository, accessToken, "POST", `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/refs`, "create_branch", {
-      ref: `refs/heads/${branchName}`,
-      sha: commitSha,
-    });
+    const response = await requestGitHub(
+      input.owner,
+      input.repository,
+      accessToken,
+      "POST",
+      `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/refs`,
+      "create_branch",
+      createDraftPrBranchPayload(branchName, commitSha),
+    );
     if (response.status === 201) return branchName;
     throw new DraftPullRequestError("branch_creation", "create_branch_status", response.status);
   } catch (error) {
@@ -376,14 +387,15 @@ async function createSentinelProposalBranch(input: VerifiedDraftPullRequestInput
 
 async function createDraftPullRequest(input: VerifiedDraftPullRequestInput, branchName: string, accessToken: string) {
   try {
-    const response = await requestGitHub(input.owner, input.repository, accessToken, "POST", `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/pulls`, "create_pull_request", {
-      title: getCommitMessage(input.dependency.name, input.dependency.latestVersion),
-      head: branchName,
-      base: input.defaultBranch,
-      draft: true,
-      maintainer_can_modify: false,
-      body: createPullRequestBody(input),
-    });
+    const response = await requestGitHub(
+      input.owner,
+      input.repository,
+      accessToken,
+      "POST",
+      `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/pulls`,
+      "create_pull_request",
+      createDraftPullRequestPayload(input, branchName),
+    );
     const pullRequest = parsePullRequest(await readBoundedJson(response, 512 * 1024));
     if (!pullRequest) throw new DraftPullRequestError("pull_request_creation", "create_pull_request_parse", response.status);
     return pullRequest;
@@ -398,8 +410,14 @@ async function findExistingDraftPullRequest(input: VerifiedDraftPullRequestInput
   const pullRequests = parsePullRequestList(await readBoundedJson(response, 2 * 1024 * 1024));
   if (!pullRequests) throw new DraftPullRequestError("github_api", "existing_pull_request_parse", response.status);
 
-  const marker = getPullRequestMarker(input.proposedChangeIdentifier);
-  const existing = pullRequests.find((pullRequest) => pullRequest.body?.includes(marker) && pullRequest.branchName.startsWith("sentinel/") && sameRepositoryFullName(pullRequest.repositoryFullName, input.owner, input.repository));
+  const existing = pullRequests.find((pullRequest) => isMatchingSentinelPullRequest({
+    body: pullRequest.body,
+    branchName: pullRequest.branchName,
+    repositoryFullName: pullRequest.repositoryFullName,
+    owner: input.owner,
+    repository: input.repository,
+    proposedChangeIdentifier: input.proposedChangeIdentifier,
+  }));
   return existing ? {
     kind: "existing",
     prNumber: existing.prNumber,
@@ -589,311 +607,48 @@ function parsePullRequestList(value: unknown) {
   return pullRequests;
 }
 
-function updateVerifiedPackageJson(content: string, input: VerifiedDraftPullRequestInput) {
-  const section = getDependencySection(input.dependency.dependencyType);
-  if (!section || !input.proposedFix.packageJsonChange.required) return null;
-  if (input.proposedFix.packageJsonChange.dependency !== input.dependency.name || input.proposedFix.packageJsonChange.from !== input.dependency.declaredVersion || input.proposedFix.packageJsonChange.to !== input.dependency.latestVersion) return null;
-
-  try {
-    const manifest: unknown = JSON.parse(content);
-    if (!isRecord(manifest) || !isRecord(manifest[section]) || manifest[section][input.dependency.name] !== input.dependency.declaredVersion) return null;
-  } catch {
-    return null;
-  }
-
-  const valueLocation = findJsonObjectStringValue(content, section, input.dependency.name);
-  if (!valueLocation || valueLocation.value !== input.dependency.declaredVersion) return null;
-  return `${content.slice(0, valueLocation.start)}${JSON.stringify(input.dependency.latestVersion)}${content.slice(valueLocation.end)}`;
-}
-
-function replaceExactVerifiedSnippet(content: string, originalSnippet: string, proposedSnippet: string) {
-  if (!originalSnippet || !proposedSnippet || hasUnsafeTextControlCharacters(originalSnippet) || hasUnsafeTextControlCharacters(proposedSnippet)) return null;
-  const firstIndex = content.indexOf(originalSnippet);
-  if (firstIndex === -1 || firstIndex !== content.lastIndexOf(originalSnippet)) return null;
-  return `${content.slice(0, firstIndex)}${proposedSnippet}${content.slice(firstIndex + originalSnippet.length)}`;
-}
-
-function findJsonObjectStringValue(content: string, objectKey: string, memberKey: string) {
-  let cursor = skipJsonWhitespace(content, 0);
-  if (content[cursor] !== "{") return null;
-  cursor += 1;
-  let objectMatches = 0;
-  let memberLocation: { start: number; end: number; value: string } | null = null;
-
-  while (true) {
-    cursor = skipJsonWhitespace(content, cursor);
-    if (content[cursor] === "}") break;
-    const key = readJsonString(content, cursor);
-    if (!key) return null;
-    cursor = skipJsonWhitespace(content, key.end);
-    if (content[cursor] !== ":") return null;
-    const valueStart = skipJsonWhitespace(content, cursor + 1);
-    if (key.value === objectKey) {
-      objectMatches += 1;
-      const foundMember = findJsonStringMemberInObject(content, valueStart, memberKey);
-      if (!foundMember || memberLocation) return null;
-      memberLocation = foundMember;
-    }
-    const valueEnd = skipJsonValue(content, valueStart);
-    if (valueEnd === null) return null;
-    cursor = skipJsonWhitespace(content, valueEnd);
-    if (content[cursor] === "}") break;
-    if (content[cursor] !== ",") return null;
-    cursor += 1;
-  }
-
-  return objectMatches === 1 ? memberLocation : null;
-}
-
-function findJsonStringMemberInObject(content: string, start: number, memberKey: string) {
-  let cursor = skipJsonWhitespace(content, start);
-  if (content[cursor] !== "{") return null;
-  cursor += 1;
-  let matches = 0;
-  let memberLocation: { start: number; end: number; value: string } | null = null;
-
-  while (true) {
-    cursor = skipJsonWhitespace(content, cursor);
-    if (content[cursor] === "}") break;
-    const key = readJsonString(content, cursor);
-    if (!key) return null;
-    cursor = skipJsonWhitespace(content, key.end);
-    if (content[cursor] !== ":") return null;
-    const valueStart = skipJsonWhitespace(content, cursor + 1);
-    if (key.value === memberKey) {
-      const value = readJsonString(content, valueStart);
-      if (!value) return null;
-      matches += 1;
-      memberLocation = value;
-    }
-    const valueEnd = skipJsonValue(content, valueStart);
-    if (valueEnd === null) return null;
-    cursor = skipJsonWhitespace(content, valueEnd);
-    if (content[cursor] === "}") break;
-    if (content[cursor] !== ",") return null;
-    cursor += 1;
-  }
-
-  return matches === 1 ? memberLocation : null;
-}
-
-function readJsonString(content: string, start: number) {
-  if (content[start] !== "\"") return null;
-  let cursor = start + 1;
-  let escaped = false;
-  while (cursor < content.length) {
-    const character = content[cursor];
-    if (!escaped && character === "\"") {
-      const end = cursor + 1;
-      try {
-        const value: unknown = JSON.parse(content.slice(start, end));
-        return typeof value === "string" ? { start, end, value } : null;
-      } catch {
-        return null;
-      }
-    }
-    if (!escaped && character === "\\") escaped = true;
-    else escaped = false;
-    cursor += 1;
-  }
-  return null;
-}
-
-function skipJsonValue(content: string, start: number): number | null {
-  const cursor = skipJsonWhitespace(content, start);
-  const character = content[cursor];
-  if (character === "\"") return readJsonString(content, cursor)?.end ?? null;
-  if (character === "{") return skipJsonObject(content, cursor);
-  if (character === "[") return skipJsonArray(content, cursor);
-  const primitive = content.slice(cursor).match(/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/)?.[0];
-  return primitive ? cursor + primitive.length : null;
-}
-
-function skipJsonObject(content: string, start: number): number | null {
-  let cursor = start + 1;
-  while (true) {
-    cursor = skipJsonWhitespace(content, cursor);
-    if (content[cursor] === "}") return cursor + 1;
-    const key = readJsonString(content, cursor);
-    if (!key) return null;
-    cursor = skipJsonWhitespace(content, key.end);
-    if (content[cursor] !== ":") return null;
-    const valueEnd = skipJsonValue(content, cursor + 1);
-    if (valueEnd === null) return null;
-    cursor = skipJsonWhitespace(content, valueEnd);
-    if (content[cursor] === "}") return cursor + 1;
-    if (content[cursor] !== ",") return null;
-    cursor += 1;
-  }
-}
-
-function skipJsonArray(content: string, start: number): number | null {
-  let cursor = start + 1;
-  while (true) {
-    cursor = skipJsonWhitespace(content, cursor);
-    if (content[cursor] === "]") return cursor + 1;
-    const valueEnd = skipJsonValue(content, cursor);
-    if (valueEnd === null) return null;
-    cursor = skipJsonWhitespace(content, valueEnd);
-    if (content[cursor] === "]") return cursor + 1;
-    if (content[cursor] !== ",") return null;
-    cursor += 1;
-  }
-}
-
-function skipJsonWhitespace(content: string, cursor: number) {
-  while (cursor < content.length && /\s/.test(content[cursor])) cursor += 1;
-  return cursor;
-}
-
-function createSentinelBranchName(dependencyName: string, targetVersion: string, proposedChangeIdentifier: string) {
-  const dependencySegment = sanitizeBranchSegment(dependencyName, "dependency", 48);
-  const majorVersion = targetVersion.match(/\d+/)?.[0] ?? "update";
-  const suffix = proposedChangeIdentifier.slice(0, 12);
-  const branch = `sentinel/${dependencySegment}-${majorVersion}-${suffix}`;
-  return branch.slice(0, DRAFT_PULL_REQUEST_LIMITS.maxBranchNameLength).replace(/[-./]+$/, "");
-}
-
-function sanitizeBranchSegment(value: string, fallback: string, maximumLength: number) {
-  const normalized = value.toLowerCase().replace(/^@/, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  return (normalized || fallback).slice(0, maximumLength).replace(/-+$/, "") || fallback;
-}
-
-function createPullRequestBody(input: VerifiedDraftPullRequestInput) {
-  const files = [
-    ...(input.proposedFix.packageJsonChange.required ? ["package.json"] : []),
-    ...input.proposedFix.files.map((file) => file.path),
-  ];
-  const validationLines = [
-    `- Install: ${formatValidationStatus(input.validation.install.status)}`,
-    ...input.validation.checks.map((check) => `- ${formatCheckName(check.name)}: ${formatValidationStatus(check.status)}`),
-  ];
-  const warningLines = input.validation.warnings.length > 0
-    ? `\nWarnings:\n${input.validation.warnings.map((warning) => `- ${toSafePullRequestText(warning)}`).join("\n")}`
-    : "";
-  const analysisSummary = toSafePullRequestText(input.impactAnalysis.summary);
-  const riskExplanation = toSafePullRequestText(input.impactAnalysis.riskExplanation);
-
-  return `## Sentinel maintenance update
-
-Dependency:
-${input.dependency.name}
-
-Declared:
-${input.dependency.declaredVersion}
-
-Target:
-${input.dependency.latestVersion}
-
-Change:
-${capitalize(input.dependency.changeType)}
-
-Risk:
-${capitalize(input.dependency.risk)}
-
-## Why this update was proposed
-
-${analysisSummary}
-
-${riskExplanation}
-
-## Changes
-
-${files.map((path) => `- ${path}`).join("\n")}
-
-## Validation
-
-${validationLines.join("\n")}${warningLines}
-
-## Important
-
-Generated by Sentinel. Automated validation does not guarantee correctness. Developer review is required before merge.
-
-${getPullRequestMarker(input.proposedChangeIdentifier)}`;
-}
-
-function getCommitMessage(dependencyName: string, targetVersion: string) {
-  return `chore(deps): update ${dependencyName} to ${targetVersion}`.slice(0, 240);
-}
-
-function getPullRequestMarker(proposedChangeIdentifier: string) {
-  return `<!-- sentinel-change-id:${proposedChangeIdentifier} -->`;
-}
-
-function toSafePullRequestText(value: string) {
-  const normalized = value.replace(/\s+/g, " ").trim().slice(0, 1_000);
-  if (!normalized || /\b(?:safe to merge|bug[- ]free|production[- ]ready|tests? (?:pass|passed))\b/i.test(normalized)) {
-    return "Sentinel identified this update for developer review based on the verified dependency and validation context.";
-  }
-  return normalized;
-}
-
-function formatValidationStatus(status: string) {
-  return status.replaceAll("_", " ").replace(/\b\w/g, (character) => character.toUpperCase());
-}
-
-function formatCheckName(name: string) {
-  if (name === "typecheck") return "Typecheck";
-  if (name === "test") return "Tests";
-  return capitalize(name);
-}
-
-function capitalize(value: string) {
-  return value ? `${value[0].toUpperCase()}${value.slice(1)}` : value;
-}
-
 function matchesValidatedBase(repository: GitHubRepositoryBase, input: VerifiedDraftPullRequestInput) {
-  return sameGitHubIdentifier(repository.owner, input.owner)
-    && sameGitHubIdentifier(repository.repository, input.repository)
-    && repository.writeAccess
-    && repository.defaultBranch === input.defaultBranch
-    && repository.baseCommitSha === input.baseCommitSha;
+  return isValidatedRepositoryHeadCurrent({
+    expected: {
+      owner: input.owner,
+      repository: input.repository,
+      defaultBranch: input.defaultBranch,
+      baseCommitSha: input.baseCommitSha,
+    },
+    actual: repository,
+  });
 }
 
 function staleBaseResult(): DraftPullRequestActionResult {
-  return { kind: "error", error: "The repository changed after validation. Run analysis and validation again before creating a PR." };
+  return draftPrError("repository_changed_since_validation", "The repository changed after validation. Run analysis and validation again before creating a PR.");
 }
 
 function branchCleanupFailureResult(branchName: string): DraftPullRequestActionResult {
-  return { kind: "error", error: `Draft PR creation did not finish. Sentinel could not confirm cleanup of ${branchName}; inspect or remove that branch manually before retrying.` };
+  return draftPrError("github_write_failed", `Draft PR creation did not finish. Sentinel could not confirm cleanup of ${branchName}; inspect or remove that branch manually before retrying.`);
 }
 
 function ambiguousPullRequestCreationResult(branchName: string | null): DraftPullRequestActionResult {
   const branchDetail = branchName ? ` Sentinel left ${branchName} in place so an existing pull request is not accidentally broken.` : "";
-  return { kind: "error", error: `GitHub did not confirm whether the draft pull request was created. Check GitHub before retrying.${branchDetail}` };
+  return draftPrError("github_write_failed", `GitHub did not confirm whether the draft pull request was created. Check GitHub before retrying.${branchDetail}`);
 }
 
 function getDraftPullRequestErrorResult(error: unknown): DraftPullRequestActionResult {
   if (error instanceof DraftPullRequestError) {
     if (error.category === "stale_base") return staleBaseResult();
-    if (error.category === "github_authorization") return { kind: "error", error: "GitHub authorization is unavailable. Reconnect GitHub and try again." };
-    if (error.category === "write_access" || error.category === "repository_restricted") return { kind: "error", error: "GitHub write access could not be verified for this repository." };
-    if (error.category === "dependency_changed") return { kind: "error", error: "This dependency no longer has the expected update. Run analysis and validation again." };
-    if (error.category === "change_verification" || error.category === "prohibited_file") return { kind: "error", error: "Sentinel could not revalidate the proposed changes against the validated repository commit." };
-    if (error.category === "branch_creation") return { kind: "error", error: "GitHub could not create a new Sentinel branch for this draft PR." };
-    if (error.category === "pull_request_creation") return { kind: "error", error: "GitHub could not create the draft pull request. Please try again." };
+    if (error.category === "github_authorization") return draftPrError("github_write_permission_required", "GitHub authorization is unavailable. Reconnect GitHub and try again.");
+    if (error.category === "write_access" || error.category === "repository_restricted") return draftPrError("github_write_permission_required", "GitHub write access could not be verified for this repository.");
+    if (error.category === "dependency_changed") return draftPrError("proposed_fix_stale", "This dependency no longer has the expected update. Run analysis and validation again.");
+    if (error.category === "lockfile_artifact_required") return draftPrError("lockfile_artifact_required", "Sentinel cannot safely create this draft PR until the validated lockfile artifact is available.");
+    if (error.category === "source_changes_not_allowed" || error.category === "prohibited_file") return draftPrError("source_changes_not_allowed", "Draft PR V1 allows only the server-verified package.json dependency change.");
+    if (error.category === "change_verification") return draftPrError("proposed_fix_stale", "Sentinel could not revalidate the package.json change against the validated repository commit.");
+    if (error.category === "branch_creation") return draftPrError("branch_conflict", "GitHub could not create a new Sentinel branch for this draft PR.");
+    if (error.category === "pull_request_creation") return draftPrError("github_write_failed", "GitHub could not create the draft pull request. Please try again.");
   }
-  return { kind: "error", error: "GitHub could not create the draft pull request. Please try again." };
+  return draftPrError("github_write_failed", "GitHub could not create the draft pull request. Please try again.");
 }
 
-function getDependencySection(type: VerifiedDraftPullRequestInput["dependency"]["dependencyType"]) {
-  if (type === "dependency") return "dependencies";
-  if (type === "devDependency") return "devDependencies";
-  if (type === "peerDependency") return "peerDependencies";
-  return "optionalDependencies";
-}
-
-function isAllowedSourceFilePath(path: string) {
-  if (!isSafeRepositoryFilePath(path) || path === "package.json") return false;
-  const segments = path.split("/");
-  const lowerSegments = segments.map((segment) => segment.toLowerCase());
-  const basename = segments.at(-1)?.toLowerCase();
-  if (!basename || lowerSegments.some((segment) => EXCLUDED_DIRECTORY_NAMES.has(segment) || PROHIBITED_FILE_NAMES.has(segment) || segment.startsWith(".env"))) return false;
-  if (lowerSegments[0] === ".github" && lowerSegments[1] === "workflows") return false;
-  if (lowerSegments.some((segment) => segment === "secrets" || segment === "credentials" || segment === "credentials.json")) return false;
-  if (basename.startsWith(".env") || PROHIBITED_FILE_NAMES.has(basename) || /^(?:generated|secrets?|credentials?)(?:[._-]|$)/i.test(basename) || basename.includes(".min.") || basename.includes(".generated.") || basename.includes(".gen.") || basename.endsWith(".d.ts")) return false;
-  const extension = basename.split(".").at(-1);
-  return !!extension && SOURCE_EXTENSIONS.has(extension);
+function draftPrError(category: DraftPrPublicErrorCategory, error: string): DraftPullRequestActionResult {
+  return { kind: "error", category, error };
 }
 
 function isSafeRepositoryFilePath(path: string) {
@@ -913,16 +668,8 @@ function sameGitHubIdentifier(left: string, right: string) {
   return left.toLowerCase() === right.toLowerCase();
 }
 
-function sameRepositoryFullName(fullName: string, owner: string, repository: string) {
-  return fullName.toLowerCase() === `${owner}/${repository}`.toLowerCase();
-}
-
 function sameGitSha(left: string, right: string) {
   return left.toLowerCase() === right.toLowerCase();
-}
-
-function hasUnsafeTextControlCharacters(value: string) {
-  return /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(value);
 }
 
 function isAmbiguousGitWriteError(error: unknown) {

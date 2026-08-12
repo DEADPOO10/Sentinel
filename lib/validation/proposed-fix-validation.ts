@@ -1,6 +1,7 @@
 import "server-only";
 
 import type { ProposedFix } from "@/lib/openai/proposed-fix";
+import { isDraftPrValidationEligible } from "@/lib/github/draft-pull-request-policy";
 import { parseSignedWorkerResponse, workerResponseBindingFailure } from "@/lib/validation/worker-response";
 import {
   MAX_WORKER_RESPONSE_BYTES,
@@ -102,8 +103,7 @@ export function createUnableToValidateResult(summary: string): ProposedFixValida
 }
 
 export function isProposedFixValidationEligibleForDraftPullRequest(result: ProposedFixValidationResult) {
-  const baseRequirementsMet = result.baseBranch !== null && result.baseCommitSha !== null && result.install.status === "passed" && result.checks.every((check) => check.status === "passed" || check.status === "skipped");
-  return baseRequirementsMet && (result.overallStatus === "passed" || (result.overallStatus === "partial" && result.partialReasons.length > 0 && result.partialReasons.every((reason) => reason === "skipped_checks" || reason === "no_lockfile_fallback")));
+  return isDraftPrValidationEligible(result);
 }
 
 type WorkerConfig = { endpoint: URL; sharedSecret: string };

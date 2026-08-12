@@ -136,28 +136,26 @@ function ProposedFixPanel({ result, validationResult, draftPullRequestResult, is
 }
 
 function ValidationResults({ result, validationTicket, draftPullRequestResult, isDraftPullRequestPending, onCreateDraftPullRequest }: { result: ProposedFixValidationResult; validationTicket?: string; draftPullRequestResult: DraftPullRequestActionResult | null; isDraftPullRequestPending: boolean; onCreateDraftPullRequest: () => void }) {
-  const canCreateDraftPullRequest = Boolean(validationTicket) && isValidationEligibleForDraftPullRequest(result);
+  // The server issues this signed ticket only after authoritative eligibility
+  // and feature-gate checks. The server action revalidates both again.
+  const canCreateDraftPullRequest = Boolean(validationTicket);
 
   return <section className="mt-4 rounded-none border border-amber-200 bg-[#f1f1ec] p-3 text-xs leading-5 text-[#5f625d]"><div className="flex flex-wrap items-center justify-between gap-2"><p className="font-semibold text-[#171817]">Validation Results</p><StatusPill value={result.overallStatus} /></div><p className="mt-2 rounded-none bg-white/70 px-3 py-2 text-[#343633]">Validation ran in a separately configured isolated worker. No repository changes were pushed.</p><ValidationStage name="Install" status={result.install.status} durationMs={null} summary={result.install.summary} />{result.checks.map((check) => <ValidationStage key={check.name} name={check.name === "typecheck" ? "Typecheck" : check.name === "lint" ? "Lint" : check.name === "test" ? "Tests" : "Build"} status={check.status} durationMs={check.durationMs} summary={check.summary} />)}{result.warnings.length > 0 && <div className="mt-3 border-t border-amber-200 pt-3"><p className="font-medium text-[#171817]">Warnings</p><ul className="mt-1 list-disc space-y-1 pl-4">{result.warnings.map((warning, index) => <li key={`validation-warning-${index}`}>{warning}</li>)}</ul></div>}{canCreateDraftPullRequest && <div className="mt-4 border-t border-amber-200 pt-4"><p className="text-xs leading-5 text-[#696b66]">Sentinel will create a new branch and draft pull request. It will not merge or modify the default branch.</p><Button type="button" size="sm" variant="outline" disabled={isDraftPullRequestPending} onClick={onCreateDraftPullRequest} className="mt-3"><GitPullRequest className="h-3.5 w-3.5" />{isDraftPullRequestPending ? "Creating draft PR…" : "Create draft PR"}</Button>{draftPullRequestResult && <DraftPullRequestResultCard result={draftPullRequestResult} validationStatus={result.overallStatus} />}</div>}</section>;
 }
 
 function DraftPullRequestResultCard({ result, validationStatus }: { result: DraftPullRequestActionResult; validationStatus: ProposedFixValidationResult["overallStatus"] }) {
-  if (result.kind === "error") return <p role="alert" className="mt-3 text-xs leading-5 text-rose-700">{result.error}</p>;
+  if (result.kind === "error") return <section role="alert" className="mt-4 rounded-none border border-rose-200 bg-white p-3 text-xs leading-5 text-rose-700"><p className="font-semibold">{getDraftPullRequestErrorTitle(result.category)}</p><p className="mt-1">{result.error}</p></section>;
 
   return <section className="mt-4 rounded-none border border-emerald-200 bg-white p-3 text-xs leading-5 text-[#5f625d]"><p className="font-semibold text-[#171817]">{result.kind === "created" ? "Draft Pull Request Created" : result.draft ? "Existing Draft Pull Request" : "Existing Pull Request"}</p><p className="mt-2 font-medium text-[#171817]">PR #{result.prNumber}</p><p className="mt-1 font-mono text-[11px] text-[#343633]">{result.dependencyName}: {result.declaredVersion} → {result.targetVersion}</p><p className="mt-2">Branch: <span className="font-mono text-[11px] text-[#343633]">{result.branchName}</span></p><p>Base branch: <span className="font-mono text-[11px] text-[#343633]">{result.baseBranch}</span></p><p>Commit: <span className="font-mono text-[11px] text-[#343633]">{result.commitSha}</span></p><div className="mt-2 flex flex-wrap items-center gap-2"><span>Validation:</span><StatusPill value={validationStatus} /></div><p className="mt-2 font-medium text-[#343633]">Status: {result.draft ? "Draft — developer review required" : "Developer review required"}</p><a href={result.prUrl} target="_blank" rel="noopener noreferrer" className="mt-3 inline-flex font-medium text-[#343633] underline underline-offset-2 hover:text-[#78350f]">Open pull request on GitHub</a><p className="mt-3 rounded-none bg-[#f1f1ec] px-3 py-2 text-[#343633]">No changes were merged automatically.</p></section>;
 }
 
-function isValidationEligibleForDraftPullRequest(result: ProposedFixValidationResult) {
-  const hasPassedCheck = result.checks.some((check) => check.status === "passed");
-  const checksAreSuccessfulOrSkipped = result.checks.every((check) => check.status === "passed" || check.status === "skipped");
-  const baseRequirementsMet = result.install.status === "passed" && hasPassedCheck && checksAreSuccessfulOrSkipped;
-
-  if (result.overallStatus === "passed") return baseRequirementsMet && result.partialReasons.length === 0 && result.checks.every((check) => check.status === "passed");
-  if (result.overallStatus !== "partial") return false;
-
-  return baseRequirementsMet
-    && result.partialReasons.length > 0
-    && result.partialReasons.every((reason) => reason === "skipped_checks" || reason === "no_lockfile_fallback");
+function getDraftPullRequestErrorTitle(category: Extract<DraftPullRequestActionResult, { kind: "error" }>["category"]) {
+  if (category === "validation_required" || category === "repository_changed_since_validation" || category === "proposed_fix_stale") return "Revalidation required";
+  if (category === "validation_not_eligible" || category === "source_changes_not_allowed" || category === "lockfile_artifact_required") return "Not eligible";
+  if (category === "pr_creation_disabled") return "Draft PR creation disabled";
+  if (category === "github_write_permission_required") return "GitHub write permission required";
+  if (category === "branch_conflict") return "Draft PR already in progress";
+  return "Draft PR could not be created";
 }
 
 function ValidationStage({ name, status, durationMs, summary }: { name: string; status: string; durationMs: number | null; summary: string }) {
