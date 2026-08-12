@@ -21,7 +21,9 @@ type PersistedScan = Omit<NonNullable<Awaited<ReturnType<typeof getLatestReposit
 const SCAN_FRESHNESS_MS = 15 * 60 * 1000;
 
 export const runtime = "nodejs";
-export const maxDuration = 90;
+// Server Actions on this page wait for the isolated worker's documented
+// five-minute validation budget. Deployment still enforces its plan limit.
+export const maxDuration = 300;
 
 export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
   const { owner, repository } = await params;

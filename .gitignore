@@ -4,5 +4,6 @@ node_modules/
 .env.local
 .env.*.local
 .npm-cache/
+.venv-modal/
 tsconfig.tsbuildinfo
 generated/prisma/

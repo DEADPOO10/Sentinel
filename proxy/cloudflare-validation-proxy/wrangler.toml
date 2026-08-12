@@ -1,0 +1,11 @@
+name = "sentinel-validation-proxy"
+main = "src/worker.mjs"
+compatibility_date = "2026-08-12"
+# Propagate an incoming client disconnect to the Modal fetch. This Worker has
+# no separate upstream deadline; Sentinel's signed worker policy is five min.
+compatibility_flags = ["request_signal_passthrough"]
+
+# This is intentionally a plain, non-secret variable. Override it with
+# `wrangler deploy --var MODAL_VALIDATION_URL:https://...` when needed.
+[vars]
+MODAL_VALIDATION_URL = "https://deadpoo10--sentinel-validation-worker-web.modal.run/v1/validations"

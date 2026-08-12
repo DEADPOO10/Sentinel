@@ -3,16 +3,18 @@ import "server-only";
 import type { ProposedFix } from "@/lib/openai/proposed-fix";
 import {
   MAX_WORKER_RESPONSE_BYTES,
+  VALIDATION_WORKER_MAX_DURATION_MS,
   VALIDATION_WORKER_POLICY,
   isSafeWorkerResult,
   signWorkerMessageSignature,
+  workerHttpErrorDiagnostics,
   verifyWorkerMessageSignature,
   type ValidationWorkerRequest,
   type ValidationWorkerResult,
 } from "@/lib/validation/worker-contract";
 
 export const PROPOSED_FIX_VALIDATION_LIMITS = {
-  maxTotalDurationMs: 5 * 60 * 1_000,
+  maxTotalDurationMs: VALIDATION_WORKER_MAX_DURATION_MS,
   maxCommandDurationMs: 90 * 1_000,
   maxCommandOutputBytes: 24 * 1_024,
   maxCommands: 5,
@@ -78,7 +80,10 @@ export async function validateProposedFixInTemporaryWorkspace(input: ValidationI
     return withBase(normalizeWorkerResult(result), input);
   } catch (error) {
     const reason = error instanceof ValidationWorkerError ? error.reason : "request_failed";
-    logSafeValidationEvent("worker_request_failed", { reason });
+    logSafeValidationEvent("worker_request_failed", {
+      reason,
+      ...(error instanceof ValidationWorkerError ? error.diagnostics : {}),
+    });
     return withBase(createUnableToValidateResult("The isolated validation worker could not complete this validation."), input);
   }
 }
@@ -138,7 +143,9 @@ async function invokeValidationWorker(config: WorkerConfig, request: ValidationW
       signal: controller.signal,
     });
     const declaredLength = Number(response.headers.get("content-length"));
-    if (!response.ok) throw new ValidationWorkerError("worker_http_error");
+    if (!response.ok) {
+      throw new ValidationWorkerError("worker_http_error", workerHttpErrorDiagnostics(response.status, config.endpoint));
+    }
     if (Number.isFinite(declaredLength) && declaredLength > MAX_WORKER_RESPONSE_BYTES) throw new ValidationWorkerError("response_too_large");
     const responseBody = await response.text();
     if (Buffer.byteLength(responseBody) > MAX_WORKER_RESPONSE_BYTES) throw new ValidationWorkerError("oversized_response");
@@ -186,5 +193,12 @@ function getErrorCode(error: unknown) {
   return error.cause.code;
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null; }
-class ValidationWorkerError extends Error { constructor(readonly reason: string) { super(reason); } }
+class ValidationWorkerError extends Error {
+  constructor(
+    readonly reason: string,
+    readonly diagnostics: Record<string, string> = {},
+  ) {
+    super(reason);
+  }
+}
 function logSafeValidationEvent(event: string, details: Record<string, string>) { console.error("[sentinel:validation-worker]", event, details); }

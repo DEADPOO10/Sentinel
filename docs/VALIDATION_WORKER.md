@@ -25,7 +25,7 @@ The worker needs its **own** narrowly scoped GitHub App installation identity, r
 
 The provider-neutral app adapter uses `POST /v1/validations`. It signs the exact JSON body with HMAC-SHA256 (`base64url`) in `x-sentinel-request-signature`, along with `x-sentinel-request-timestamp`. The worker must reject stale timestamps and invalid signatures. It returns the `ValidationWorkerResult` shape and signs the exact response body in `x-sentinel-worker-signature`. Sentinel verifies that signature, job ID, commit SHA, bounded response size, and every status field before it persists or issues a validation ticket.
 
-The endpoint must be HTTPS and exactly `/v1/validations`. A provider can queue internally but must return the finished structured result within the configured request lifetime; Sentinel intentionally has no validation-job database table yet. If a long-running asynchronous design is needed, stop and add durable job persistence first rather than pretending a serverless request is reliable.
+The endpoint must be HTTPS and exactly `/v1/validations`. A provider can queue internally but must return the finished structured result within the configured request lifetime; Sentinel intentionally has no validation-job database table yet. The Sentinel HTTP caller and the repository page Server Action are configured for the same five-minute worker budget. The deployed Vercel plan must support a 300-second Node.js function duration. If a long-running asynchronous design is needed, stop and add durable job persistence first rather than pretending a serverless request is reliable.
 
 ## Modal worker implementation
 

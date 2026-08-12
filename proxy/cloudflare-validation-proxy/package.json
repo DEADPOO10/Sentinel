@@ -1,0 +1,16 @@
+{
+  "name": "sentinel-cloudflare-validation-proxy",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Minimal byte-preserving Cloudflare Worker proxy for Sentinel validation requests.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/worker.test.mjs",
+    "lint": "node --check src/worker.mjs && node --check test/worker.test.mjs",
+    "typecheck": "node --check src/worker.mjs",
+    "build": "node --check src/worker.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 import modal
@@ -39,18 +42,53 @@ WORKER_IMAGE = (
 # does not include FastAPI or receive the outer worker's secrets.
 SANDBOX_IMAGE = (
     modal.Image.from_registry("node:22.14.0-bookworm-slim")
-    .apt_install("python3")
+    .apt_install("python3", "util-linux")
     .run_commands(
         "useradd --create-home --uid 10001 --shell /usr/sbin/nologin sentinel",
         "corepack enable",
-        "mkdir -p /work /opt/sentinel && chown -R sentinel:sentinel /work /opt/sentinel",
+        "mkdir -p /work/repo && chown -R sentinel:sentinel /work",
     )
-    .add_local_file("worker/sandbox_agent.py", remote_path="/opt/sentinel/worker/sandbox_agent.py", copy=True)
-    .run_commands("chown -R sentinel:sentinel /opt/sentinel")
     .run_commands("test \"$(id -u sentinel)\" = 10001")
+    .run_commands(
+        "test \"$(/usr/bin/setpriv --reuid=10001 --regid=10001 --clear-groups --no-new-privs -- /usr/bin/id -u)\" = 10001"
+    )
 )
 app = modal.App(APP_NAME)
 logger = logging.getLogger("sentinel.validation_worker")
+
+TRUSTED_SANDBOX_AGENT_PATH = Path("/opt/sentinel/worker/sandbox_agent.py")
+SANDBOX_AGENT_REMOTE_PATH = "/tmp/sentinel/sandbox_agent.py"
+MAX_SANDBOX_AGENT_BYTES = 64 * 1024
+SANDBOX_USER_PREFIX = (
+    "/usr/bin/setpriv",
+    "--reuid=10001",
+    "--regid=10001",
+    "--clear-groups",
+    "--no-new-privs",
+    "--",
+)
+SANDBOX_COMMAND_ENV = {
+    "HOME": "/tmp",
+    "npm_config_ignore_scripts": "true",
+    "npm_config_audit": "false",
+    "npm_config_fund": "false",
+}
+MAX_SAFE_SDK_REASON_CHARS = 240
+ANSI_ESCAPE_RE = re.compile(
+    r"\x1B(?:\][^\x07\x1B]*(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~]|[()#][0-2AB]|[@-_])"
+)
+MALFORMED_ANSI_ESCAPE_RE = re.compile(r"\ufffd\[[0-?]*[ -/]*[@-~]")
+
+SAFE_SANDBOX_FAILURE_STAGES = frozenset(
+    {
+        "sandbox_create_failed",
+        "sandbox_upload_failed",
+        "sandbox_network_lockdown_failed",
+        "sandbox_exec_failed",
+        "sandbox_result_invalid",
+        "sandbox_cleanup_failed",
+    }
+)
 
 
 def create_api():
@@ -78,10 +116,11 @@ def create_api():
         except (ValidationError, json.JSONDecodeError) as error:
             return signed_error(secret, job, "The validation job could not be safely prepared.", getattr(error, "args", ["invalid_job"])[0], 422)
         try:
-            return signed_json(secret, execute_job(job), 200)
+            return signed_json(secret, await execute_job(job), 200)
         except ValidationError as error:
             return signed_json(secret, result_for_error(job, "The isolated validation worker could not safely complete this validation.", error.args[0]), 200)
         except Exception:
+            log_sandbox_failure("sandbox_result_invalid")
             return signed_json(secret, result_for_error(job, "The isolated validation worker could not complete this validation.", "worker_failure"), 200)
 
     return api
@@ -93,54 +132,172 @@ def web():
     return create_api()
 
 
-def execute_job(job: dict[str, Any]) -> dict[str, Any]:
-    archive = fetch_verified_archive(job)
-    inspect_github_zip(archive)
+async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
+    # urllib is only used for the trusted outer-worker GitHub fetch. Modal
+    # operations below always use the SDK's native async .aio interface.
+    archive = await asyncio.to_thread(fetch_verified_archive, job)
+    await asyncio.to_thread(inspect_github_zip, archive)
     sandbox = None
+    result: dict[str, Any] | None = None
     started = time.monotonic()
     try:
-        sandbox = create_sandbox(job)
-        sandbox.filesystem.write_bytes(archive, "/tmp/source.zip")
-        sandbox.filesystem.write_bytes(canonical_json(job), "/tmp/job.json")
-        prepare = sandbox.exec("/usr/bin/python3", "/opt/sentinel/worker/sandbox_agent.py", "/tmp/source.zip", "/tmp/job.json", timeout=30, workdir="/work")
-        if prepare.wait() != 0:
-            raise ValidationError("patch_binding_failed")
-        manager = determine_package_manager(sandbox)
-        install = run_command(sandbox, install_argv(manager), 90)
-        if install["status"] != "passed":
-            return completed_result(job, "failed", {"status": "failed", "summary": install["summary"]}, skipped_checks("Not run because dependency installation failed."), ["dependency_install_failed"], [])
-        # This method is deliberately required: it replaces the initial registry
-        # allowlist with no egress before any repository-defined npm script runs.
-        sandbox._experimental_set_outbound_network_policy(outbound_domain_allowlist=[], outbound_cidr_allowlist=[])
-        checks = []
-        for name in CHECK_NAMES:
-            if time.monotonic() - started >= 300:
-                checks.extend(skipped_checks("Not run because the total job deadline was reached.", names=CHECK_NAMES[len(checks) :]))
-                return completed_result(job, "partial", {"status": "passed", "summary": "Installed with scripts disabled."}, checks, ["total_deadline_reached"], ["skipped_checks"])
-            if not has_package_script(sandbox, name):
-                checks.append({"name": name, "status": "skipped", "durationMs": 0, "summary": "No package script is defined."})
-                continue
-            checks.append(run_command(sandbox, [manager, "run", name, "--if-present"], 90, name=name))
-            if checks[-1]["status"] in {"failed", "timed_out"}:
-                checks.extend(skipped_checks("Not run after a failed check.", names=CHECK_NAMES[len(checks) :]))
-                return completed_result(job, "failed", {"status": "passed", "summary": "Installed with scripts disabled."}, checks, ["validation_check_failed"], [])
-        skipped = any(check["status"] == "skipped" for check in checks)
-        return completed_result(job, "partial" if skipped else "passed", {"status": "passed", "summary": "Installed with scripts disabled."}, checks, ["one_or_more_allowlisted_checks_not_defined"] if skipped else [], ["skipped_checks"] if skipped else [])
+        sandbox = await create_sandbox(job)
+        await upload_sandbox_inputs(sandbox, archive, job)
+        await prepare_sandbox_workspace(sandbox)
+        manager = await determine_package_manager(sandbox)
+        lockfile_synchronized = False
+        if manager == "npm" and job["proposedFix"]["packageJsonChange"]["required"]:
+            await verify_npm_lockfile_binding(sandbox, job)
+            lockfile_sync = await run_command(sandbox, npm_lockfile_sync_argv(), 90)
+            if lockfile_sync["status"] != "passed":
+                result = completed_result(
+                    job,
+                    "failed",
+                    {"status": "failed", "summary": lockfile_sync["summary"]},
+                    skipped_checks("Not run because package-lock synchronization failed."),
+                    ["lockfile_update_failed"],
+                    [],
+                )
+            else:
+                # `npm install --package-lock-only` must not be allowed to
+                # alter the authorized package.json edit while it resolves the
+                # transitive graph. Recheck the exact server-authorized value.
+                await verify_npm_lockfile_binding(sandbox, job)
+                lockfile_synchronized = True
+        if result is None:
+            install = await run_command(sandbox, install_argv(manager), 90)
+            if install["status"] != "passed":
+                result = completed_result(job, "failed", {"status": "failed", "summary": install["summary"]}, skipped_checks("Not run because dependency installation failed."), ["dependency_install_failed"], [])
+            else:
+                await disable_sandbox_egress(sandbox)
+                checks = []
+                for name in CHECK_NAMES:
+                    if time.monotonic() - started >= 300:
+                        checks.extend(skipped_checks("Not run because the total job deadline was reached.", names=CHECK_NAMES[len(checks) :]))
+                        result = completed_result(job, "partial", {"status": "passed", "summary": install_summary(lockfile_synchronized)}, checks, ["total_deadline_reached"], ["skipped_checks"])
+                        break
+                    if not await has_package_script(sandbox, name):
+                        checks.append({"name": name, "status": "skipped", "durationMs": 0, "summary": "No package script is defined."})
+                        continue
+                    checks.append(await run_command(sandbox, [manager, "run", name, "--if-present"], 90, name=name))
+                    if checks[-1]["status"] in {"failed", "timed_out"}:
+                        checks.extend(skipped_checks("Not run after a failed check.", names=CHECK_NAMES[len(checks) :]))
+                        result = completed_result(job, "failed", {"status": "passed", "summary": install_summary(lockfile_synchronized)}, checks, ["validation_check_failed"], [])
+                        break
+                if result is None:
+                    skipped = any(check["status"] == "skipped" for check in checks)
+                    warnings = ["package_lock_synchronized_in_sandbox"] if lockfile_synchronized else []
+                    if skipped:
+                        warnings.append("one_or_more_allowlisted_checks_not_defined")
+                    result = completed_result(job, "partial" if skipped else "passed", {"status": "passed", "summary": install_summary(lockfile_synchronized)}, checks, warnings, ["skipped_checks"] if skipped else [])
     finally:
         if sandbox is not None:
-            sandbox.terminate(wait=True)
-            sandbox.detach()
+            cleanup_succeeded = await cleanup_sandbox(sandbox)
+            if result is not None and not cleanup_succeeded:
+                mark_cleanup_unconfirmed(result)
+    if result is None:
+        log_sandbox_failure("sandbox_result_invalid")
+        raise ValidationError("sandbox_result_invalid")
+    return result
 
 
-def create_sandbox(job: dict[str, Any]):
+async def create_sandbox(job: dict[str, Any]):
     # No Modal Secret or inherited environment is attached to this Sandbox.
     # The initial TLS-only egress allowlist is removed before checks execute.
-    return modal.Sandbox.create(
-        "sleep", "300", app=app, image=SANDBOX_IMAGE, timeout=300, idle_timeout=300,
-        cpu=(1.0, 1.0), memory=(2048, 2048), workdir="/work/repo", secrets=[],
-        outbound_domain_allowlist=["registry.npmjs.org", "registry.yarnpkg.com"], outbound_cidr_allowlist=[],
-        env={"HOME": "/tmp", "npm_config_ignore_scripts": "true", "npm_config_audit": "false", "npm_config_fund": "false"},
-    )
+    try:
+        return await modal.Sandbox.create.aio(
+            *SANDBOX_USER_PREFIX, "/usr/bin/sleep", "300",
+            app=app, image=SANDBOX_IMAGE, timeout=300, idle_timeout=300,
+            cpu=(1.0, 1.0), memory=(2048, 2048), workdir="/work", secrets=[],
+            outbound_domain_allowlist=["registry.npmjs.org", "registry.yarnpkg.com"], outbound_cidr_allowlist=[],
+        )
+    except Exception as error:
+        log_sandbox_create_failure(error)
+        raise ValidationError("sandbox_create_failed") from error
+
+
+async def upload_sandbox_inputs(sandbox, archive: bytes, job: dict[str, Any]) -> None:
+    try:
+        await sandbox.filesystem.write_bytes.aio(archive, "/tmp/source.zip")
+    except Exception as error:
+        log_sandbox_upload_failure(error, "archive")
+        raise ValidationError("sandbox_upload_failed") from error
+    try:
+        await sandbox.filesystem.write_bytes.aio(canonical_json(job), "/tmp/job.json")
+    except Exception as error:
+        log_sandbox_upload_failure(error, "job")
+        raise ValidationError("sandbox_upload_failed") from error
+    try:
+        await sandbox.filesystem.copy_from_local.aio(
+            trusted_sandbox_agent_path(), SANDBOX_AGENT_REMOTE_PATH
+        )
+    except Exception as error:
+        log_sandbox_upload_failure(error, "trusted_agent")
+        raise ValidationError("sandbox_upload_failed") from error
+
+
+async def prepare_sandbox_workspace(sandbox) -> None:
+    try:
+        process = await sandbox.exec.aio(
+            *SANDBOX_USER_PREFIX,
+            "/usr/bin/python3",
+            SANDBOX_AGENT_REMOTE_PATH,
+            "/tmp/source.zip",
+            "/tmp/job.json",
+            timeout=30,
+            workdir="/work",
+        )
+        await read_bounded_output(process)
+        exit_code = await process.wait.aio()
+    except Exception as error:
+        log_sandbox_failure("sandbox_exec_failed")
+        raise ValidationError("sandbox_exec_failed") from error
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        log_sandbox_failure("sandbox_result_invalid")
+        raise ValidationError("sandbox_result_invalid")
+    if exit_code == 3:
+        # Exit code 3 is reserved by the trusted setup agent for a lockfile
+        # that did not identify the unpacked root package before it changed
+        # package.json. Do not continue with dependency resolution.
+        raise ValidationError("lockfile_update_failed")
+    if exit_code != 0:
+        log_sandbox_failure("sandbox_exec_failed")
+        raise ValidationError("patch_binding_failed")
+
+
+async def disable_sandbox_egress(sandbox) -> None:
+    # This method is deliberately required: it replaces the initial registry
+    # allowlist with no egress before any repository-defined npm script runs.
+    try:
+        await sandbox._experimental_set_outbound_network_policy.aio(outbound_domain_allowlist=[], outbound_cidr_allowlist=[])
+    except Exception as error:
+        log_sandbox_failure("sandbox_network_lockdown_failed")
+        raise ValidationError("sandbox_network_lockdown_failed") from error
+
+
+async def cleanup_sandbox(sandbox) -> bool:
+    cleanup_succeeded = True
+    try:
+        await sandbox.terminate.aio(wait=True)
+    except Exception:
+        cleanup_succeeded = False
+        log_sandbox_failure("sandbox_cleanup_failed")
+    finally:
+        try:
+            await sandbox.detach.aio()
+        except Exception:
+            cleanup_succeeded = False
+            log_sandbox_failure("sandbox_cleanup_failed")
+    return cleanup_succeeded
+
+
+def mark_cleanup_unconfirmed(result: dict[str, Any]) -> None:
+    if "sandbox_cleanup_failed" not in result["warnings"]:
+        result["warnings"].append("sandbox_cleanup_failed")
+    if "cleanup_unconfirmed" not in result["partialReasons"]:
+        result["partialReasons"].append("cleanup_unconfirmed")
+    if result["overallStatus"] == "passed":
+        result["overallStatus"] = "partial"
 
 
 def fetch_verified_archive(job: dict[str, Any]) -> bytes:
@@ -179,9 +336,13 @@ def github_bytes(url: str, token: str, maximum: int = MAX_ARCHIVE_COMPRESSED_BYT
         raise ValidationError("github_fetch_failed") from error
 
 
-def determine_package_manager(sandbox) -> str:
+async def determine_package_manager(sandbox) -> str:
     # Lockfile selection is fixed and does not inspect or execute package scripts.
-    files = {entry.path.rsplit("/", 1)[-1] for entry in sandbox.filesystem.list_files("/work/repo")}
+    try:
+        files = {entry.path.rsplit("/", 1)[-1] for entry in await sandbox.filesystem.list_files.aio("/work/repo")}
+    except Exception as error:
+        log_sandbox_failure("sandbox_result_invalid")
+        raise ValidationError("sandbox_result_invalid") from error
     if "package-lock.json" in files:
         return "npm"
     if "pnpm-lock.yaml" in files:
@@ -191,45 +352,133 @@ def determine_package_manager(sandbox) -> str:
     raise ValidationError("no_lockfile")
 
 
-def install_argv(manager: str) -> list[str]:
-    return {"npm": ["npm", "ci", "--ignore-scripts", "--no-audit", "--fund=false"], "pnpm": ["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"], "yarn": ["yarn", "install", "--immutable", "--ignore-scripts"]}[manager]
-
-
-def run_command(sandbox, argv: list[str], timeout_seconds: int, *, name: str | None = None) -> dict[str, Any]:
-    started = time.monotonic()
-    process = sandbox.exec(*argv, timeout=timeout_seconds, workdir="/work/repo", env={"HOME": "/tmp", "npm_config_ignore_scripts": "true", "npm_config_audit": "false", "npm_config_fund": "false"}, pty=True)
+async def verify_npm_lockfile_binding(sandbox, job: dict[str, Any]) -> None:
+    """Accept only an npm lockfile that identifies the validated root package."""
     try:
-        output = read_bounded_output(process, sandbox)
-        exit_code = process.wait()
-    except Exception:
+        package = json.loads(await sandbox.filesystem.read_text.aio("/work/repo/package.json"))
+        lockfile = json.loads(await sandbox.filesystem.read_text.aio("/work/repo/package-lock.json"))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise ValidationError("lockfile_update_failed") from error
+    root = npm_lockfile_root(lockfile)
+    change = job["proposedFix"]["packageJsonChange"]
+    section = {
+        "dependency": "dependencies",
+        "devDependency": "devDependencies",
+        "peerDependency": "peerDependencies",
+        "optionalDependency": "optionalDependencies",
+    }[job["dependencyType"]]
+    dependencies = package.get(section) if isinstance(package, dict) else None
+    if (
+        not isinstance(package, dict)
+        or not isinstance(root, dict)
+        or package.get("name") != root.get("name")
+        or package.get("version") != root.get("version")
+        or not isinstance(dependencies, dict)
+        or dependencies.get(change["dependency"]) != change["to"]
+    ):
+        raise ValidationError("lockfile_update_failed")
+
+
+def npm_lockfile_root(lockfile: Any) -> dict[str, Any] | None:
+    """Read root metadata from npm lockfile v1, v2, or v3 without guessing."""
+    if not isinstance(lockfile, dict):
+        return None
+    packages = lockfile.get("packages")
+    if isinstance(packages, dict) and isinstance(packages.get(""), dict):
+        return packages[""]
+    if "name" in lockfile and "version" in lockfile:
+        return {"name": lockfile["name"], "version": lockfile["version"]}
+    return None
+
+
+def npm_lockfile_sync_argv() -> list[str]:
+    return ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"]
+
+
+def install_argv(manager: str) -> list[str]:
+    return {"npm": ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"], "pnpm": ["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"], "yarn": ["yarn", "install", "--immutable", "--ignore-scripts"]}[manager]
+
+
+def install_summary(lockfile_synchronized: bool) -> str:
+    if lockfile_synchronized:
+        return "package-lock.json was regenerated only inside the isolated validation sandbox; dependencies installed with scripts disabled."
+    return "Installed with scripts disabled."
+
+
+async def run_command(sandbox, argv: list[str], timeout_seconds: int, *, name: str | None = None) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        process = await sandbox.exec.aio(
+            *SANDBOX_USER_PREFIX,
+            *argv,
+            timeout=timeout_seconds,
+            workdir="/work/repo",
+            env=SANDBOX_COMMAND_ENV,
+            pty=True,
+        )
+    except Exception as error:
+        log_sandbox_failure("sandbox_exec_failed")
+        raise ValidationError("sandbox_exec_failed") from error
+    timed_out = False
+    try:
+        output = await read_bounded_output(process)
+        exit_code = await process.wait.aio()
+    except TimeoutError:
+        # A command reaching its fixed 90-second execution limit is a normal
+        # validation outcome, not a worker orchestration failure.
         output = "Command did not complete before its execution limit."
         exit_code = 1
+        timed_out = True
+    except Exception as error:
+        log_sandbox_failure("sandbox_exec_failed")
+        raise ValidationError("sandbox_exec_failed") from error
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        log_sandbox_failure("sandbox_result_invalid")
+        raise ValidationError("sandbox_result_invalid")
     duration = min(int((time.monotonic() - started) * 1000), 90000)
     summary = output or ("Completed." if exit_code == 0 else "Command failed without output.")
     if name is None:
         return {"status": "passed" if exit_code == 0 else "failed", "summary": summary}
-    status = "passed" if exit_code == 0 else ("timed_out" if duration >= 89_000 else "failed")
+    status = "passed" if exit_code == 0 else ("timed_out" if timed_out or duration >= 89_000 else "failed")
     return {"name": name, "status": status, "durationMs": duration, "summary": summary}
 
 
-def read_bounded_output(process, sandbox) -> str:
+async def read_bounded_output(process) -> str:
     fragments: list[str] = []
     size = 0
+    truncated = False
     # PTY mode intentionally multiplexes stdout and stderr into one stream,
     # avoiding a blocked process on an unread stderr pipe.
-    for line in process.stdout:
+    async for line in process.stdout:
         encoded = line.encode("utf-8", "replace")
-        if size + len(encoded) > MAX_COMMAND_OUTPUT_BYTES:
-            sandbox.terminate(wait=False)
-            return "Command output exceeded the 24 KiB limit."
+        remaining = MAX_COMMAND_OUTPUT_BYTES - size
+        if remaining <= 0:
+            truncated = True
+            continue
+        if len(encoded) > remaining:
+            fragments.append(encoded[:remaining].decode("utf-8", "ignore"))
+            size = MAX_COMMAND_OUTPUT_BYTES
+            truncated = True
+            continue
         fragments.append(line)
         size += len(encoded)
-    return "".join(fragments).strip()[:1000] or "Completed without output."
+    output = normalize_command_output("".join(fragments)).strip()[:1000]
+    if truncated:
+        return (output + "\nCommand output was truncated at the 24 KiB diagnostic limit.").strip()
+    return output or "Completed without output."
 
 
-def has_package_script(sandbox, name: str) -> bool:
+def normalize_command_output(output: str) -> str:
+    """Remove terminal controls while retaining readable, bounded command diagnostics."""
+    output = output.replace("\r\n", "\n").replace("\r", "\n")
+    output = ANSI_ESCAPE_RE.sub("", output)
+    output = MALFORMED_ANSI_ESCAPE_RE.sub("", output)
+    return "".join(character for character in output if character in {"\n", "\t"} or ord(character) >= 32 and ord(character) != 127)
+
+
+async def has_package_script(sandbox, name: str) -> bool:
     try:
-        package = json.loads(sandbox.filesystem.read_text("/work/repo/package.json"))
+        package = json.loads(await sandbox.filesystem.read_text.aio("/work/repo/package.json"))
     except (OSError, ValueError, json.JSONDecodeError):
         return False
     return isinstance(package, dict) and isinstance(package.get("scripts"), dict) and isinstance(package["scripts"].get(name), str)
@@ -256,3 +505,74 @@ def signed_error(secret: str, job: dict[str, Any] | None, summary: str, warning:
 def log_request_auth_failure(reason: str) -> None:
     # Reasons are fixed labels only: never log credentials, signatures, or body data.
     logger.warning("validation request authentication rejected: reason=%s", reason)
+
+
+def log_sandbox_failure(stage: str) -> None:
+    # This is intentionally restricted to fixed labels: never emit a request,
+    # repository path, command output, exception text, or environment value.
+    if stage not in SAFE_SANDBOX_FAILURE_STAGES:
+        stage = "sandbox_result_invalid"
+    logger.warning("[sentinel:validation-worker] %s", stage)
+
+
+def trusted_sandbox_agent_path() -> Path:
+    """Return the immutable trusted agent baked into the outer worker image."""
+    try:
+        metadata = TRUSTED_SANDBOX_AGENT_PATH.stat()
+    except OSError as error:
+        raise FileNotFoundError("trusted_agent_source_missing") from error
+    if not TRUSTED_SANDBOX_AGENT_PATH.is_file():
+        raise FileNotFoundError("trusted_agent_source_missing")
+    if metadata.st_size <= 0 or metadata.st_size > MAX_SANDBOX_AGENT_BYTES:
+        raise ValueError("trusted_agent_source_invalid")
+    return TRUSTED_SANDBOX_AGENT_PATH
+
+
+def log_sandbox_create_failure(error: Exception) -> None:
+    metadata = {
+        "errorType": safe_sdk_identifier(type(error).__name__, "ModalError"),
+        "reason": sanitize_sdk_error_reason(error),
+    }
+    grpc_status = getattr(error, "_grpc_status", None)
+    if grpc_status is not None:
+        metadata["modalStatus"] = safe_sdk_identifier(getattr(grpc_status, "name", ""), "UNKNOWN")
+    logger.warning(
+        "[sentinel:validation-worker] sandbox_create_failed %s",
+        json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+    )
+
+
+def log_sandbox_upload_failure(error: Exception, destination: str) -> None:
+    metadata = {
+        "destination": destination if destination in {"archive", "job", "trusted_agent"} else "unknown",
+        "errorType": safe_sdk_identifier(type(error).__name__, "UploadError"),
+        "reason": sanitize_sdk_error_reason(error),
+    }
+    grpc_status = getattr(error, "_grpc_status", None)
+    if grpc_status is not None:
+        metadata["modalStatus"] = safe_sdk_identifier(getattr(grpc_status, "name", ""), "UNKNOWN")
+    logger.warning(
+        "[sentinel:validation-worker] sandbox_upload_failed %s",
+        json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+    )
+
+
+def safe_sdk_identifier(value: Any, fallback: str) -> str:
+    text = str(value)
+    return text if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,79}", text) else fallback
+
+
+def sanitize_sdk_error_reason(error: Exception) -> str:
+    reason = " ".join(str(error).split())
+    reason = re.sub(
+        r"(?i)\b(authorization|bearer|token|secret|signature|password|credential|api[_-]?key)\b\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|\S+)",
+        r"\1=<redacted>",
+        reason,
+    )
+    reason = re.sub(r"\b[A-Z][A-Z0-9_]{2,}\s*=\s*(?:\"[^\"]*\"|'[^']*'|\S+)", "<env>=<redacted>", reason)
+    reason = re.sub(r"https?://\S+", "<url>", reason)
+    reason = re.sub(r"(?:[A-Za-z]:)?/(?:[^\s/]+/)*[^\s,;:)]*", "<path>", reason)
+    reason = re.sub(r"\b[A-Fa-f0-9]{32,}\b", "<opaque>", reason)
+    reason = re.sub(r"\b[A-Za-z0-9_-]{40,}\b", "<opaque>", reason)
+    reason = "".join(character if 32 <= ord(character) <= 126 else "?" for character in reason)
+    return (reason[:MAX_SAFE_SDK_REASON_CHARS] or "unclassified_modal_sdk_error").strip()

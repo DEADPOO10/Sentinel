@@ -10,6 +10,16 @@ import zipfile
 from pathlib import Path
 
 MAX_EXTRACTED_BYTES = 100 * 1024 * 1024
+DEPENDENCY_SECTIONS = {
+    "dependency": "dependencies",
+    "devDependency": "devDependencies",
+    "peerDependency": "peerDependencies",
+    "optionalDependency": "optionalDependencies",
+}
+
+
+class LockfileBindingError(ValueError):
+    """A root package-lock.json did not match package.json before mutation."""
 
 
 def safe_path(path: str) -> bool:
@@ -49,7 +59,45 @@ def prepare(archive_path: Path, job_path: Path) -> None:
             with archive.open(entry) as source, destination.open("xb") as output:
                 while chunk := source.read(64 * 1024):
                     output.write(chunk)
+    if job["proposedFix"]["packageJsonChange"]["required"]:
+        verify_original_npm_lockfile_binding(target)
     apply_changes(target, job)
+
+
+def verify_original_npm_lockfile_binding(root: Path) -> None:
+    """Verify the root npm lock belongs to this checkout before any edit.
+
+    A missing lockfile is handled by the outer worker's package-manager
+    detection. This guard only applies when an npm lockfile is present.
+    """
+    lockfile_path = root / "package-lock.json"
+    if not lockfile_path.is_file():
+        return
+    try:
+        package = json.loads((root / "package.json").read_text("utf-8"))
+        lockfile = json.loads(lockfile_path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise LockfileBindingError("invalid npm lockfile") from error
+    lock_root = npm_lockfile_root(lockfile)
+    if (
+        not isinstance(package, dict)
+        or not isinstance(lock_root, dict)
+        or package.get("name") != lock_root.get("name")
+        or package.get("version") != lock_root.get("version")
+    ):
+        raise LockfileBindingError("npm lockfile root mismatch")
+
+
+def npm_lockfile_root(lockfile: object) -> dict | None:
+    """Read root metadata from npm lockfile v1, v2, or v3 without guessing."""
+    if not isinstance(lockfile, dict):
+        return None
+    packages = lockfile.get("packages")
+    if isinstance(packages, dict) and isinstance(packages.get(""), dict):
+        return packages[""]
+    if "name" in lockfile and "version" in lockfile:
+        return {"name": lockfile["name"], "version": lockfile["version"]}
+    return None
 
 
 def apply_changes(root: Path, job: dict) -> None:
@@ -58,7 +106,8 @@ def apply_changes(root: Path, job: dict) -> None:
     if change["required"]:
         package_json = root / "package.json"
         package = json.loads(package_json.read_text("utf-8"))
-        section = package.get(job["dependencyType"] + "s")
+        section_name = DEPENDENCY_SECTIONS.get(job["dependencyType"])
+        section = package.get(section_name) if section_name else None
         if not isinstance(section, dict) or section.get(change["dependency"]) != change["from"]:
             raise ValueError("package dependency binding failed")
         section[change["dependency"]] = change["to"]
@@ -78,4 +127,9 @@ def apply_changes(root: Path, job: dict) -> None:
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         raise SystemExit(2)
-    prepare(Path(sys.argv[1]), Path(sys.argv[2]))
+    try:
+        prepare(Path(sys.argv[1]), Path(sys.argv[2]))
+    except LockfileBindingError:
+        # This fixed exit code is intentionally the only information passed to
+        # the outer worker. It becomes the safe lockfile_update_failed result.
+        raise SystemExit(3)

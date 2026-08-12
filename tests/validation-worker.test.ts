@@ -1,7 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHmac } from "node:crypto";
-import { isAllowedValidationCommand, isSafeArchiveEntryPath, isSafeWorkerResult, verifyWorkerMessageSignature } from "../lib/validation/worker-contract.ts";
+import { isAllowedValidationCommand, isSafeArchiveEntryPath, isSafeWorkerResult, VALIDATION_WORKER_MAX_DURATION_MS, VALIDATION_WORKER_POLICY, verifyWorkerMessageSignature, workerHttpErrorDiagnostics } from "../lib/validation/worker-contract.ts";
+
+test("the worker's documented validation budget is five minutes", () => {
+  assert.equal(VALIDATION_WORKER_MAX_DURATION_MS, 300_000);
+  assert.equal(VALIDATION_WORKER_POLICY.execution.maxDurationMs, VALIDATION_WORKER_MAX_DURATION_MS);
+});
+
+test("HTTP failure diagnostics contain only a status and determined upstream category", () => {
+  assert.deepEqual(
+    workerHttpErrorDiagnostics(504, new URL("https://sentinel-validation-proxy.example.workers.dev/v1/validations")),
+    { status: "504", upstream: "cloudflare_proxy" },
+  );
+  assert.deepEqual(
+    workerHttpErrorDiagnostics(500, new URL("https://example.modal.run/v1/validations")),
+    { status: "500", upstream: "validation_worker" },
+  );
+});
 
 test("validation commands are exact allowlist entries", () => {
   assert.equal(isAllowedValidationCommand(["npm", "ci", "--ignore-scripts", "--no-audit", "--fund=false"], "npm"), true);

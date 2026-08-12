@@ -2,6 +2,7 @@ import type { ProposedFix } from "@/lib/openai/proposed-fix";
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 export const MAX_WORKER_RESPONSE_BYTES = 64 * 1_024;
+export const VALIDATION_WORKER_MAX_DURATION_MS = 5 * 60 * 1_000;
 const CHECK_NAMES = ["typecheck", "lint", "test", "build"] as const;
 const CHECK_STATUSES = ["passed", "failed", "skipped", "timed_out"] as const;
 const OVERALL_STATUSES = ["passed", "failed", "partial", "unable_to_validate"] as const;
@@ -10,7 +11,7 @@ const PARTIAL_REASONS = ["skipped_checks", "no_lockfile_fallback", "cleanup_unco
 /** This policy is sent to every provider and must be enforced by the worker. */
 export const VALIDATION_WORKER_POLICY = {
   version: 1,
-  execution: { nonRoot: true, privileged: false, readOnlyRootFilesystem: true, ephemeralWorkspace: true, cpuMillicores: 1_000, memoryMiB: 2_048, maxDurationMs: 5 * 60 * 1_000, maxCommandDurationMs: 90 * 1_000, maxCommandOutputBytes: 24 * 1_024 },
+  execution: { nonRoot: true, privileged: false, readOnlyRootFilesystem: true, ephemeralWorkspace: true, cpuMillicores: 1_000, memoryMiB: 2_048, maxDurationMs: VALIDATION_WORKER_MAX_DURATION_MS, maxCommandDurationMs: 90 * 1_000, maxCommandOutputBytes: 24 * 1_024 },
   archive: { maxCompressedBytes: 25 * 1_024 * 1_024, maxExtractedBytes: 100 * 1_024 * 1_024, rejectAbsolutePaths: true, rejectParentTraversal: true, rejectSymlinks: true },
   network: { install: { mode: "allowlist", hosts: ["registry.npmjs.org", "registry.yarnpkg.com"] }, checks: { mode: "disabled" } },
   installScripts: "disabled",
@@ -44,6 +45,17 @@ export function verifyWorkerMessageSignature(secret: string, payload: string, si
 /** Signs the exact UTF-8 JSON text sent over the validation worker boundary. */
 export function signWorkerMessageSignature(secret: string, payload: string) {
   return createHmac("sha256", secret).update(payload).digest("base64url");
+}
+
+/** Safe metadata for non-successful HTTP responses; never includes body data. */
+export function workerHttpErrorDiagnostics(status: number, endpoint: URL) {
+  const host = endpoint.hostname.toLowerCase();
+  const upstream = host.endsWith(".workers.dev") || host.endsWith(".cloudflareworkers.com")
+    ? "cloudflare_proxy"
+    : host.endsWith(".modal.run")
+      ? "validation_worker"
+      : "unknown";
+  return { status: String(status), upstream };
 }
 
 export function isSafeWorkerResult(value: unknown): value is ValidationWorkerResult {

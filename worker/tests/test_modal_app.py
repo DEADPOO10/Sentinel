@@ -1,12 +1,118 @@
+import json
 import os
+import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
-from worker.core import sign
-from worker.modal_app import create_api
+from worker.core import CHECK_NAMES, MAX_COMMAND_OUTPUT_BYTES, POLICY, ValidationError, canonical_json, sign, verify_signature
+from worker.modal_app import SANDBOX_AGENT_REMOTE_PATH, SANDBOX_USER_PREFIX, cleanup_sandbox, create_api, execute_job, install_argv, normalize_command_output, npm_lockfile_sync_argv, read_bounded_output, trusted_sandbox_agent_path
+
+
+def valid_job():
+    return {
+        "version": 1,
+        "jobId": "4f15241e-8c5d-4a4a-8d8d-963402b51d4a",
+        "repository": {"owner": "octo-org", "name": "example", "commitSha": "a" * 40},
+        "dependencyType": "dependency",
+        "proposedFix": {
+            "title": "Update example",
+            "summary": "Update the dependency.",
+            "confidence": 90,
+            "files": [],
+            "packageJsonChange": {"required": True, "dependency": "example", "from": "1.0.0", "to": "1.1.0"},
+            "validationSteps": ["Run the repository test suite."],
+            "warnings": [],
+        },
+        "policy": POLICY,
+    }
+
+
+class AioOnlyCall:
+    """A Modal-shaped call which fails if the blocking API is used."""
+
+    def __init__(self, *, return_value=None, side_effect=None):
+        self.aio = AsyncMock(return_value=return_value, side_effect=side_effect)
+
+    def __call__(self, *args, **kwargs):
+        raise AssertionError("A blocking Modal interface was used in an async path")
+
+
+class FakeStdout:
+    def __init__(self, lines=()):
+        self._lines = list(lines)
+
+    def __aiter__(self):
+        async def stream():
+            for line in self._lines:
+                yield line
+
+        return stream()
+
+
+class FakeProcess:
+    def __init__(self, *, exit_code=0, output=""):
+        self.stdout = FakeStdout([output] if output else [])
+        self.wait = AioOnlyCall(return_value=exit_code)
+
+
+class FakeSandbox:
+    def __init__(
+        self,
+        *,
+        archive_upload_error=None,
+        job_upload_error=None,
+        agent_upload_error=None,
+        lockfile_sync_exit=0,
+        install_exit=0,
+        lockfile_dependency_version="8.1.0",
+        lockfile_root_name="example",
+    ):
+        scripts = {name: "node -e \"process.exit(0)\"" for name in CHECK_NAMES}
+        package = {
+            "name": "example",
+            "version": "1.0.0",
+            "dependencies": {"example": "1.1.0"},
+            "scripts": scripts,
+        }
+        lockfile = {
+            "name": lockfile_root_name,
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": lockfile_root_name, "version": "1.0.0"},
+                "node_modules/example": {"version": lockfile_dependency_version},
+            },
+        }
+        self.filesystem = SimpleNamespace(
+            write_bytes=AioOnlyCall(side_effect=[archive_upload_error, job_upload_error]),
+            copy_from_local=AioOnlyCall(side_effect=agent_upload_error),
+            list_files=AioOnlyCall(return_value=[SimpleNamespace(path="/work/repo/package-lock.json")]),
+            read_text=AioOnlyCall(
+                side_effect=[
+                    json.dumps(package),
+                    json.dumps(lockfile),
+                    json.dumps(package),
+                    json.dumps(lockfile),
+                    *[json.dumps(package) for _ in CHECK_NAMES],
+                ]
+            ),
+        )
+        self.exec = AioOnlyCall(
+            side_effect=[
+                FakeProcess(output="prepared"),
+                FakeProcess(exit_code=lockfile_sync_exit, output="lockfile synchronized"),
+                FakeProcess(exit_code=install_exit, output="installed"),
+                *[FakeProcess(output=name) for name in CHECK_NAMES],
+            ]
+        )
+        self._experimental_set_outbound_network_policy = AioOnlyCall()
+        self.terminate = AioOnlyCall()
+        self.detach = AioOnlyCall()
 
 
 class ModalAppTests(unittest.TestCase):
@@ -42,6 +148,278 @@ class ModalAppTests(unittest.TestCase):
                     response = client.post("/v1/validations", content=body, headers={"content-type": "application/json", **headers})
                 self.assertEqual(response.status_code, 401)
                 self.assertEqual(logs.output, [f"WARNING:sentinel.validation_worker:validation request authentication rejected: reason={reason}"])
+
+    def test_authenticated_async_failure_returns_a_signed_safe_stage_reason(self):
+        secret = "x" * 32
+        body = canonical_json(valid_job())
+        headers = {
+            "content-type": "application/json",
+            "x-sentinel-request-signature": sign(secret, body),
+            "x-sentinel-request-timestamp": str(int(time.time() * 1000)),
+        }
+        with patch.dict(os.environ, {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret}, clear=False), patch(
+            "worker.modal_app.execute_job", new=AsyncMock(side_effect=ValidationError("sandbox_create_failed"))
+        ):
+            response = TestClient(create_api()).post("/v1/validations", content=body, headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["overallStatus"], "unable_to_validate")
+        self.assertEqual(response.json()["warnings"], ["sandbox_create_failed"])
+        signature = response.headers["x-sentinel-worker-signature"]
+        self.assertTrue(verify_signature(secret, response.content, signature))
+        self.assertFalse(verify_signature(secret, response.content + b" ", signature))
+
+
+class ModalAsyncExecutionTests(unittest.IsolatedAsyncioTestCase):
+    def test_trusted_agent_path_requires_the_baked_outer_worker_file(self):
+        from worker import modal_app
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sandbox_agent.py"
+            source.write_text("print('trusted')\n", "utf-8")
+            with patch("worker.modal_app.TRUSTED_SANDBOX_AGENT_PATH", source):
+                self.assertEqual(trusted_sandbox_agent_path(), source)
+
+            with patch("worker.modal_app.TRUSTED_SANDBOX_AGENT_PATH", source.with_name("missing.py")):
+                with self.assertRaisesRegex(FileNotFoundError, "trusted_agent_source_missing"):
+                    trusted_sandbox_agent_path()
+
+    async def test_create_sandbox_uses_the_async_modal_interface(self):
+        from worker import modal_app
+
+        fake_sandbox = object()
+        create = AioOnlyCall(return_value=fake_sandbox)
+        with patch("worker.modal_app.modal.Sandbox.create", new=create):
+            result = await modal_app.create_sandbox(valid_job())
+
+        self.assertIs(result, fake_sandbox)
+        create.aio.assert_awaited_once()
+        call = create.aio.await_args
+        self.assertEqual(call.args[: len(SANDBOX_USER_PREFIX)], SANDBOX_USER_PREFIX)
+        self.assertEqual(call.args[len(SANDBOX_USER_PREFIX) :], ("/usr/bin/sleep", "300"))
+        self.assertEqual(call.kwargs["workdir"], "/work")
+        self.assertEqual(call.kwargs["cpu"], (1.0, 1.0))
+        self.assertEqual(call.kwargs["memory"], (2048, 2048))
+        self.assertEqual(call.kwargs["timeout"], 300)
+        self.assertEqual(call.kwargs["idle_timeout"], 300)
+        self.assertEqual(call.kwargs["secrets"], [])
+        self.assertEqual(call.kwargs["outbound_domain_allowlist"], ["registry.npmjs.org", "registry.yarnpkg.com"])
+        self.assertEqual(call.kwargs["outbound_cidr_allowlist"], [])
+        self.assertNotIn("env", call.kwargs)
+
+    async def test_create_failure_logs_only_sanitized_sdk_metadata(self):
+        from worker import modal_app
+
+        class FakeModalError(Exception):
+            _grpc_status = SimpleNamespace(name="INVALID_ARGUMENT")
+
+        unsafe_values = (
+            "do-not-log-token",
+            "do-not-log-secret",
+            "https://private.invalid/resource",
+            "/private/customer/repository/file.js",
+        )
+        error = FakeModalError(
+            f"token={unsafe_values[0]} SECRET_VALUE={unsafe_values[1]} "
+            f"url={unsafe_values[2]} local file {unsafe_values[3]} does not exist"
+        )
+        create = AioOnlyCall(side_effect=error)
+        with patch("worker.modal_app.modal.Sandbox.create", new=create), self.assertLogs(
+            "sentinel.validation_worker", level="WARNING"
+        ) as logs:
+            with self.assertRaisesRegex(ValidationError, "sandbox_create_failed"):
+                await modal_app.create_sandbox(valid_job())
+
+        line = logs.output[0]
+        self.assertIn("[sentinel:validation-worker] sandbox_create_failed", line)
+        self.assertIn('"errorType":"FakeModalError"', line)
+        self.assertIn('"modalStatus":"INVALID_ARGUMENT"', line)
+        self.assertIn("<redacted>", line)
+        self.assertIn("<url>", line)
+        self.assertIn("<path>", line)
+        for unsafe_value in unsafe_values:
+            self.assertNotIn(unsafe_value, line)
+
+    async def test_execute_job_uses_async_sandbox_apis_end_to_end(self):
+        sandbox = FakeSandbox()
+        with patch("worker.modal_app.fetch_verified_archive", return_value=b"checked archive"), patch(
+            "worker.modal_app.inspect_github_zip"
+        ), patch("worker.modal_app.create_sandbox", new=AsyncMock(return_value=sandbox)), patch(
+            "worker.modal_app.trusted_sandbox_agent_path", return_value=Path("/opt/sentinel/worker/sandbox_agent.py")
+        ):
+            result = await execute_job(valid_job())
+
+        self.assertEqual(result["overallStatus"], "passed")
+        self.assertIn("package_lock_synchronized_in_sandbox", result["warnings"])
+        self.assertIn("regenerated only inside the isolated validation sandbox", result["install"]["summary"])
+        self.assertEqual(result["repository"]["commitSha"], "a" * 40)
+        self.assertEqual(sandbox.filesystem.write_bytes.aio.await_count, 2)
+        sandbox.filesystem.copy_from_local.aio.assert_awaited_once_with(
+            Path("/opt/sentinel/worker/sandbox_agent.py"), SANDBOX_AGENT_REMOTE_PATH
+        )
+        self.assertEqual(sandbox.exec.aio.await_count, 3 + len(CHECK_NAMES))
+        calls = sandbox.exec.aio.await_args_list
+        self.assertEqual(calls[1].args[len(SANDBOX_USER_PREFIX) :], tuple(npm_lockfile_sync_argv()))
+        self.assertEqual(calls[2].args[len(SANDBOX_USER_PREFIX) :], tuple(install_argv("npm")))
+        self.assertEqual(npm_lockfile_sync_argv(), ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"])
+        self.assertEqual(install_argv("npm"), ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"])
+        for call in sandbox.exec.aio.await_args_list:
+            self.assertEqual(call.args[: len(SANDBOX_USER_PREFIX)], SANDBOX_USER_PREFIX)
+        sandbox.filesystem.list_files.aio.assert_awaited_once_with("/work/repo")
+        sandbox._experimental_set_outbound_network_policy.aio.assert_awaited_once_with(
+            outbound_domain_allowlist=[], outbound_cidr_allowlist=[]
+        )
+        sandbox.terminate.aio.assert_awaited_once_with(wait=True)
+        sandbox.detach.aio.assert_awaited_once()
+
+    async def test_stale_npm_lockfile_is_synchronized_before_clean_install(self):
+        sandbox = FakeSandbox(lockfile_dependency_version="8.1.0")
+        with patch("worker.modal_app.fetch_verified_archive", return_value=b"checked archive"), patch(
+            "worker.modal_app.inspect_github_zip"
+        ), patch("worker.modal_app.create_sandbox", new=AsyncMock(return_value=sandbox)), patch(
+            "worker.modal_app.trusted_sandbox_agent_path", return_value=Path("/opt/sentinel/worker/sandbox_agent.py")
+        ):
+            result = await execute_job(valid_job())
+
+        self.assertEqual(result["overallStatus"], "passed")
+        commands = [
+            call.args[len(SANDBOX_USER_PREFIX) :]
+            for call in sandbox.exec.aio.await_args_list
+        ]
+        self.assertEqual(commands[1], tuple(npm_lockfile_sync_argv()))
+        self.assertEqual(commands[2], tuple(install_argv("npm")))
+
+    async def test_npm_lockfile_sync_failure_is_safe_and_does_not_install_or_run_scripts(self):
+        sandbox = FakeSandbox(lockfile_sync_exit=1)
+        with patch("worker.modal_app.fetch_verified_archive", return_value=b"checked archive"), patch(
+            "worker.modal_app.inspect_github_zip"
+        ), patch("worker.modal_app.create_sandbox", new=AsyncMock(return_value=sandbox)), patch(
+            "worker.modal_app.trusted_sandbox_agent_path", return_value=Path("/opt/sentinel/worker/sandbox_agent.py")
+        ):
+            result = await execute_job(valid_job())
+
+        self.assertEqual(result["overallStatus"], "failed")
+        self.assertEqual(result["warnings"], ["lockfile_update_failed"])
+        self.assertEqual(sandbox.exec.aio.await_count, 2)
+        sandbox._experimental_set_outbound_network_policy.aio.assert_not_awaited()
+        sandbox.terminate.aio.assert_awaited_once_with(wait=True)
+        sandbox.detach.aio.assert_awaited_once()
+
+    async def test_npm_ci_failure_after_lockfile_sync_keeps_install_failure_category(self):
+        sandbox = FakeSandbox(install_exit=1)
+        with patch("worker.modal_app.fetch_verified_archive", return_value=b"checked archive"), patch(
+            "worker.modal_app.inspect_github_zip"
+        ), patch("worker.modal_app.create_sandbox", new=AsyncMock(return_value=sandbox)), patch(
+            "worker.modal_app.trusted_sandbox_agent_path", return_value=Path("/opt/sentinel/worker/sandbox_agent.py")
+        ):
+            result = await execute_job(valid_job())
+
+        self.assertEqual(result["overallStatus"], "failed")
+        self.assertEqual(result["warnings"], ["dependency_install_failed"])
+        self.assertEqual(sandbox.exec.aio.await_count, 3)
+        sandbox._experimental_set_outbound_network_policy.aio.assert_not_awaited()
+
+    async def test_egress_is_locked_only_after_resolution_and_before_repository_scripts(self):
+        sandbox = FakeSandbox()
+        events: list[str] = []
+
+        async def record_command(_sandbox, argv, _timeout, *, name=None):
+            if argv == npm_lockfile_sync_argv():
+                events.append("lockfile_sync")
+                return {"status": "passed", "summary": "synchronized"}
+            if argv == install_argv("npm"):
+                events.append("clean_install")
+                return {"status": "passed", "summary": "installed"}
+            events.append(f"script:{name}")
+            return {"name": name, "status": "passed", "durationMs": 1, "summary": "passed"}
+
+        async def record_lockdown(_sandbox):
+            events.append("egress_locked")
+
+        with patch("worker.modal_app.fetch_verified_archive", return_value=b"checked archive"), patch(
+            "worker.modal_app.inspect_github_zip"
+        ), patch("worker.modal_app.create_sandbox", new=AsyncMock(return_value=sandbox)), patch(
+            "worker.modal_app.trusted_sandbox_agent_path", return_value=Path("/opt/sentinel/worker/sandbox_agent.py")
+        ), patch("worker.modal_app.run_command", new=record_command), patch(
+            "worker.modal_app.disable_sandbox_egress", new=record_lockdown
+        ):
+            result = await execute_job(valid_job())
+
+        self.assertEqual(result["overallStatus"], "passed")
+        self.assertEqual(events[:3], ["lockfile_sync", "clean_install", "egress_locked"])
+        self.assertTrue(all(events.index("egress_locked") < index for index, value in enumerate(events) if value.startswith("script:")))
+
+    async def test_trusted_agent_lockfile_binding_exit_becomes_safe_lockfile_failure(self):
+        sandbox = FakeSandbox()
+        sandbox.exec = AioOnlyCall(side_effect=[FakeProcess(exit_code=3, output="")])
+
+        with self.assertRaisesRegex(ValidationError, "lockfile_update_failed"):
+            from worker import modal_app
+
+            await modal_app.prepare_sandbox_workspace(sandbox)
+
+    async def test_upload_failure_has_a_safe_stage_and_still_attempts_cleanup(self):
+        unsafe_error = RuntimeError(
+            "token=do-not-log-token SECRET_VALUE=do-not-log-secret "
+            "https://private.invalid/source /private/customer/agent.py"
+        )
+        sandbox = FakeSandbox(agent_upload_error=unsafe_error)
+        with patch("worker.modal_app.fetch_verified_archive", return_value=b"checked archive"), patch(
+            "worker.modal_app.inspect_github_zip"
+        ), patch("worker.modal_app.create_sandbox", new=AsyncMock(return_value=sandbox)), patch(
+            "worker.modal_app.trusted_sandbox_agent_path", return_value=Path("/opt/sentinel/worker/sandbox_agent.py")
+        ), self.assertLogs(
+            "sentinel.validation_worker", level="WARNING"
+        ) as logs:
+            with self.assertRaisesRegex(ValidationError, "sandbox_upload_failed"):
+                await execute_job(valid_job())
+
+        line = logs.output[0]
+        self.assertIn("[sentinel:validation-worker] sandbox_upload_failed", line)
+        self.assertIn('"destination":"trusted_agent"', line)
+        self.assertIn('"errorType":"RuntimeError"', line)
+        self.assertIn("<redacted>", line)
+        self.assertIn("<url>", line)
+        self.assertIn("<path>", line)
+        for unsafe_value in ("do-not-log-token", "do-not-log-secret", "private.invalid", "/private/customer/agent.py"):
+            self.assertNotIn(unsafe_value, line)
+        sandbox.terminate.aio.assert_awaited_once_with(wait=True)
+        sandbox.detach.aio.assert_awaited_once()
+
+    async def test_agent_upload_permission_failure_is_safe(self):
+        sandbox = FakeSandbox(agent_upload_error=PermissionError("permission denied"))
+        with patch("worker.modal_app.trusted_sandbox_agent_path", return_value=Path("/opt/sentinel/worker/sandbox_agent.py")), self.assertLogs(
+            "sentinel.validation_worker", level="WARNING"
+        ) as logs:
+            with self.assertRaisesRegex(ValidationError, "sandbox_upload_failed"):
+                from worker import modal_app
+
+                await modal_app.upload_sandbox_inputs(sandbox, b"archive", valid_job())
+
+        self.assertIn('"destination":"trusted_agent"', logs.output[0])
+        self.assertIn('"errorType":"PermissionError"', logs.output[0])
+        sandbox.filesystem.copy_from_local.aio.assert_awaited_once()
+
+    async def test_cleanup_detaches_even_when_termination_fails(self):
+        sandbox = FakeSandbox()
+        sandbox.terminate.aio.side_effect = RuntimeError("sensitive detail")
+        with self.assertLogs("sentinel.validation_worker", level="WARNING") as logs:
+            self.assertFalse(await cleanup_sandbox(sandbox))
+
+        self.assertEqual(logs.output, ["WARNING:sentinel.validation_worker:[sentinel:validation-worker] sandbox_cleanup_failed"])
+        sandbox.terminate.aio.assert_awaited_once_with(wait=True)
+        sandbox.detach.aio.assert_awaited_once()
+
+    async def test_verbose_output_is_drained_and_truncated_without_a_sandbox_kill(self):
+        output = await read_bounded_output(FakeProcess(output="x" * (MAX_COMMAND_OUTPUT_BYTES + 1)))
+
+        self.assertIn("Command output was truncated at the 24 KiB diagnostic limit.", output)
+        self.assertLessEqual(len(output), 1_100)
+
+    def test_command_output_removes_ansi_and_control_sequences(self):
+        output = normalize_command_output("\x1b[1G\x1b[0K\x1b[31mnpm error\x1b[39m\r\nnext\x07\ufffd[1G")
+
+        self.assertEqual(output, "npm error\nnext")
 
 
 if __name__ == "__main__":
