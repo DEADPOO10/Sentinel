@@ -10,6 +10,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,12 @@ SANDBOX_COMMAND_ENV = {
 MAX_SAFE_SDK_REASON_CHARS = 240
 MAX_RESULT_SUMMARY_CHARS = 1_000
 TRUNCATED_OUTPUT_NOTICE = "Command output was truncated at the 24 KiB diagnostic limit."
+# Keep a small beginning for command identity and a larger ending for the
+# failure summary most test runners print last. Together with the marker these
+# never exceed MAX_COMMAND_OUTPUT_BYTES.
+COMMAND_OUTPUT_HEAD_BYTES = 8 * 1024
+COMMAND_OUTPUT_TRUNCATION_MARKER = "\n\n... output truncated by Sentinel ...\n\n"
+COMMAND_OUTPUT_TAIL_BYTES = MAX_COMMAND_OUTPUT_BYTES - COMMAND_OUTPUT_HEAD_BYTES - len(COMMAND_OUTPUT_TRUNCATION_MARKER.encode("utf-8"))
 # The Modal function has a hard five-minute limit. Keep a small, explicit
 # reserve so termination, result signing, and response delivery are not
 # competing with an in-flight repository command at that deadline.
@@ -491,53 +498,112 @@ async def run_command(sandbox, argv: list[str], timeout_seconds: int, *, name: s
         raise ValidationError("sandbox_exec_failed") from error
     timed_out = False
     try:
-        output = await read_bounded_output(process)
-        exit_code = await process.wait.aio()
+        captured_output = await read_bounded_output(process)
     except TimeoutError:
         # A command reaching its execution limit is a normal
         # validation outcome, not a worker orchestration failure.
         check_label = {"typecheck": "Typecheck", "lint": "Lint", "test": "Tests", "build": "Build"}.get(name or "", "This check")
-        output = f"{check_label} exceeded the isolated validation time budget." if name is not None else "Dependency installation did not complete before its execution limit."
+        captured_output = CapturedCommandOutput(
+            text=f"{check_label} exceeded the isolated validation time budget." if name is not None else "Dependency installation did not complete before its execution limit.",
+            tail="",
+            truncated=False,
+        )
         exit_code = 1
         timed_out = True
     except Exception as error:
         log_sandbox_failure("sandbox_exec_failed")
         raise ValidationError("sandbox_exec_failed") from error
+    if not timed_out:
+        try:
+            exit_code = await process.wait.aio()
+        except TimeoutError:
+            check_label = {"typecheck": "Typecheck", "lint": "Lint", "test": "Tests", "build": "Build"}.get(name or "", "This check")
+            timeout_summary = f"{check_label} exceeded the isolated validation time budget." if name is not None else "Dependency installation did not complete before its execution limit."
+            captured_output = CapturedCommandOutput(
+                text=captured_output.text or timeout_summary,
+                tail=captured_output.tail,
+                truncated=captured_output.truncated,
+            )
+            exit_code = 1
+            timed_out = True
+        except Exception as error:
+            log_sandbox_failure("sandbox_exec_failed")
+            raise ValidationError("sandbox_exec_failed") from error
     if not isinstance(exit_code, int) or isinstance(exit_code, bool):
         log_sandbox_failure("sandbox_result_invalid")
         raise ValidationError("sandbox_result_invalid")
     duration = min(int((time.monotonic() - started) * 1000), timeout_seconds * 1000)
-    summary = output or ("Completed." if exit_code == 0 else "Command failed without output.")
+    summary = command_summary(captured_output, failure_or_timeout=exit_code != 0 or timed_out)
     if name is None:
         return {"status": "passed" if exit_code == 0 else "failed", "summary": summary}
     status = "passed" if exit_code == 0 else ("timed_out" if timed_out else "failed")
     return {"name": name, "status": status, "durationMs": duration, "summary": summary}
 
 
-async def read_bounded_output(process) -> str:
-    fragments: list[str] = []
-    size = 0
+@dataclass(frozen=True)
+class CapturedCommandOutput:
+    text: str
+    tail: str
+    truncated: bool
+
+
+async def read_bounded_output(process) -> CapturedCommandOutput:
+    retained = bytearray()
+    tail = bytearray()
+    total = 0
     truncated = False
     # PTY mode intentionally multiplexes stdout and stderr into one stream,
     # avoiding a blocked process on an unread stderr pipe.
     async for line in process.stdout:
         encoded = line.encode("utf-8", "replace")
-        remaining = MAX_COMMAND_OUTPUT_BYTES - size
-        if remaining <= 0:
-            truncated = True
-            continue
-        if len(encoded) > remaining:
-            fragments.append(encoded[:remaining].decode("utf-8", "ignore"))
-            size = MAX_COMMAND_OUTPUT_BYTES
-            truncated = True
-            continue
-        fragments.append(line)
-        size += len(encoded)
-    output = normalize_command_output("".join(fragments)).strip()[:MAX_RESULT_SUMMARY_CHARS]
-    if truncated:
-        prefix_limit = MAX_RESULT_SUMMARY_CHARS - len(TRUNCATED_OUTPUT_NOTICE) - 1
-        return (output[:prefix_limit].rstrip() + "\n" + TRUNCATED_OUTPUT_NOTICE).strip()
-    return output or "Completed without output."
+        previous_total = total
+        total += len(encoded)
+        if len(retained) < MAX_COMMAND_OUTPUT_BYTES:
+            retained.extend(encoded[: MAX_COMMAND_OUTPUT_BYTES - len(retained)])
+        if total > MAX_COMMAND_OUTPUT_BYTES:
+            if not truncated:
+                # The first oversized chunk may contain both the retained head
+                # and tail. Derive the tail before dropping the middle.
+                overflow_start = max(0, MAX_COMMAND_OUTPUT_BYTES - previous_total)
+                tail = append_trailing_bytes(retained[-COMMAND_OUTPUT_TAIL_BYTES:], encoded, COMMAND_OUTPUT_TAIL_BYTES, start=overflow_start)
+                truncated = True
+            else:
+                tail = append_trailing_bytes(tail, encoded, COMMAND_OUTPUT_TAIL_BYTES)
+    if not truncated:
+        output = normalize_command_output(retained.decode("utf-8", "ignore")).strip()
+        return CapturedCommandOutput(text=output or "Completed without output.", tail=output, truncated=False)
+
+    head = retained[:COMMAND_OUTPUT_HEAD_BYTES].decode("utf-8", "ignore")
+    tail_text = normalize_command_output(tail.decode("utf-8", "ignore")).strip()
+    output = normalize_command_output(head).strip() + COMMAND_OUTPUT_TRUNCATION_MARKER + tail_text
+    return CapturedCommandOutput(text=output.strip(), tail=tail_text, truncated=True)
+
+
+def trailing_bytes(value: bytes | bytearray, maximum: int) -> bytearray:
+    return bytearray(value[-maximum:])
+
+
+def append_trailing_bytes(existing: bytearray, addition: bytes, maximum: int, *, start: int = 0) -> bytearray:
+    available = len(addition) - start
+    if available >= maximum:
+        return bytearray(addition[-maximum:])
+    relevant = addition[start:]
+    if len(existing) + available <= maximum:
+        return existing + relevant
+    return bytearray(existing[-(maximum - available) :] + relevant)
+
+
+def command_summary(captured: CapturedCommandOutput, *, failure_or_timeout: bool) -> str:
+    """Return the signed 1,000-character summary without expanding the contract."""
+    source = captured.tail if failure_or_timeout and captured.tail else captured.text
+    if captured.truncated:
+        prefix = TRUNCATED_OUTPUT_NOTICE + " Final output:\n"
+        return (prefix + source[-(MAX_RESULT_SUMMARY_CHARS - len(prefix)) :]).strip()
+    if len(source) <= MAX_RESULT_SUMMARY_CHARS:
+        return source or ("Command failed without output." if failure_or_timeout else "Completed without output.")
+    if failure_or_timeout:
+        return ("…\n" + source[-(MAX_RESULT_SUMMARY_CHARS - 2) :]).strip()
+    return source[:MAX_RESULT_SUMMARY_CHARS].rstrip()
 
 
 def normalize_command_output(output: str) -> str:

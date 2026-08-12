@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from worker.core import CHECK_NAMES, MAX_COMMAND_OUTPUT_BYTES, POLICY, ValidationError, canonical_json, sign, verify_signature
-from worker.modal_app import CHECK_TIMEOUT_SECONDS, CLEANUP_RESERVE_SECONDS, MAX_RESULT_SUMMARY_CHARS, SANDBOX_AGENT_REMOTE_PATH, SANDBOX_USER_PREFIX, TOTAL_VALIDATION_DURATION_SECONDS, TRUNCATED_OUTPUT_NOTICE, VALIDATION_EXECUTION_BUDGET_SECONDS, cleanup_sandbox, command_timeout_seconds, create_api, execute_job, install_argv, normalize_command_output, npm_lockfile_sync_argv, read_bounded_output, run_validation_checks, trusted_sandbox_agent_path
+from worker.modal_app import CHECK_TIMEOUT_SECONDS, CLEANUP_RESERVE_SECONDS, MAX_RESULT_SUMMARY_CHARS, SANDBOX_AGENT_REMOTE_PATH, SANDBOX_USER_PREFIX, TOTAL_VALIDATION_DURATION_SECONDS, TRUNCATED_OUTPUT_NOTICE, VALIDATION_EXECUTION_BUDGET_SECONDS, cleanup_sandbox, command_summary, command_timeout_seconds, create_api, execute_job, install_argv, normalize_command_output, npm_lockfile_sync_argv, read_bounded_output, run_validation_checks, trusted_sandbox_agent_path
 
 
 def valid_job():
@@ -541,10 +541,62 @@ class ModalAsyncExecutionTests(unittest.IsolatedAsyncioTestCase):
         sandbox.detach.aio.assert_awaited_once()
 
     async def test_verbose_output_is_drained_and_truncated_without_a_sandbox_kill(self):
-        output = await read_bounded_output(FakeProcess(output="x" * (MAX_COMMAND_OUTPUT_BYTES + 1)))
+        captured = await read_bounded_output(FakeProcess(output="x" * (MAX_COMMAND_OUTPUT_BYTES + 1)))
 
-        self.assertIn(TRUNCATED_OUTPUT_NOTICE, output)
-        self.assertLessEqual(len(output), MAX_RESULT_SUMMARY_CHARS)
+        self.assertTrue(captured.truncated)
+        self.assertIn("... output truncated by Sentinel ...", captured.text)
+        self.assertLessEqual(len(captured.text.encode("utf-8")), MAX_COMMAND_OUTPUT_BYTES)
+        self.assertLessEqual(len(command_summary(captured, failure_or_timeout=False)), MAX_RESULT_SUMMARY_CHARS)
+
+    async def test_output_under_the_limit_is_unchanged(self):
+        original = "Mocha output\nall tests passed\n"
+        captured = await read_bounded_output(FakeProcess(output=original))
+
+        self.assertFalse(captured.truncated)
+        self.assertEqual(captured.text, original.strip())
+        self.assertEqual(command_summary(captured, failure_or_timeout=False), original.strip())
+
+    async def test_huge_failing_output_retains_final_failure_in_summary(self):
+        failure = "FAILURE: AssertionError: expected 200 to equal 201\n    at test/api.js:42:7\n2 failing"
+        captured = await read_bounded_output(FakeProcess(output=("  ✓ passing test\n" * 3_000) + failure))
+        summary = command_summary(captured, failure_or_timeout=True)
+
+        self.assertTrue(captured.truncated)
+        self.assertIn("... output truncated by Sentinel ...", captured.text)
+        self.assertIn("AssertionError: expected 200 to equal 201", captured.tail)
+        self.assertIn("AssertionError: expected 200 to equal 201", summary)
+        self.assertIn(TRUNCATED_OUTPUT_NOTICE, summary)
+        self.assertLessEqual(len(captured.text.encode("utf-8")), MAX_COMMAND_OUTPUT_BYTES)
+        self.assertLessEqual(len(summary), MAX_RESULT_SUMMARY_CHARS)
+
+    async def test_huge_timeout_output_retains_final_tail(self):
+        failure = "Timeout diagnostic: tests were still running after the allotted time."
+        sandbox = SimpleNamespace(exec=AioOnlyCall(return_value=TimedOutProcess(output=("passing\n" * 4_000) + failure)))
+        from worker import modal_app
+
+        result = await modal_app.run_command(sandbox, ["npm", "run", "test", "--if-present"], 120, name="test")
+
+        self.assertEqual(result["status"], "timed_out")
+        self.assertIn(failure, result["summary"])
+        self.assertIn(TRUNCATED_OUTPUT_NOTICE, result["summary"])
+        self.assertLessEqual(len(result["summary"]), MAX_RESULT_SUMMARY_CHARS)
+
+    async def test_multibyte_output_remains_valid_and_bounded(self):
+        failure = "FAILURE: अपेक्षित परिणाम नहीं मिला 🚨"
+        captured = await read_bounded_output(FakeProcess(output=("✅ passing\n" * 4_000) + failure))
+        summary = command_summary(captured, failure_or_timeout=True)
+
+        self.assertIn(failure, summary)
+        self.assertLessEqual(len(captured.text.encode("utf-8")), MAX_COMMAND_OUTPUT_BYTES)
+        self.assertLessEqual(len(summary), MAX_RESULT_SUMMARY_CHARS)
+        self.assertNotIn("\ufffd", summary)
+
+    async def test_command_diagnostics_do_not_add_data_not_present_in_output(self):
+        captured = await read_bounded_output(FakeProcess(output=("passing\n" * 4_000) + "FAILURE: expected false to be true"))
+        summary = command_summary(captured, failure_or_timeout=True)
+
+        self.assertNotIn("not-a-real-secret", captured.text)
+        self.assertNotIn("not-a-real-secret", summary)
 
     async def test_timed_out_command_summary_is_bounded_and_ansi_clean(self):
         sandbox = SimpleNamespace(exec=AioOnlyCall(return_value=TimedOutProcess(output="\x1b[31mverbose output\x1b[0m")))
