@@ -31,6 +31,7 @@ function currentNpmValidationResult(overrides: Record<string, unknown> = {}): Va
 test("the worker's documented validation budget is five minutes", () => {
   assert.equal(VALIDATION_WORKER_MAX_DURATION_MS, 300_000);
   assert.equal(VALIDATION_WORKER_POLICY.execution.maxDurationMs, VALIDATION_WORKER_MAX_DURATION_MS);
+  assert.equal(VALIDATION_WORKER_POLICY.execution.maxCommandDurationMs, 120_000);
 });
 
 test("HTTP failure diagnostics contain only a status and determined upstream category", () => {
@@ -61,7 +62,7 @@ test("worker results require bounded, complete status data", () => {
   assert.equal(isSafeWorkerResult(result), true);
   assert.equal(isSafeWorkerResult({ ...result, checks: result.checks.slice(1) }), false);
   assert.equal(isSafeWorkerResult({ ...result, checks: result.checks.map((check) => ({ ...check, durationMs: 999_999_999 })) }), false);
-  assert.equal(isSafeWorkerResult({ ...result, overallStatus: "failed", checks: result.checks.map((check) => check.name === "test" ? { ...check, status: "timed_out", durationMs: 90_000, summary: "Command timed out." } : check) }), true);
+  assert.equal(isSafeWorkerResult({ ...result, overallStatus: "partial", checks: result.checks.map((check) => check.name === "test" ? { ...check, status: "timed_out", durationMs: 120_000, summary: "Tests exceeded the isolated validation time budget." } : check), warnings: ["validation_check_timed_out"], partialReasons: ["validation_timeout"] }), true);
 });
 
 test("the current npm lockfile-sync result is accepted as exact signed worker JSON", () => {

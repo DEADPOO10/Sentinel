@@ -15,7 +15,7 @@ import {
 
 export const PROPOSED_FIX_VALIDATION_LIMITS = {
   maxTotalDurationMs: VALIDATION_WORKER_MAX_DURATION_MS,
-  maxCommandDurationMs: 90 * 1_000,
+  maxCommandDurationMs: 120 * 1_000,
   maxCommandOutputBytes: 24 * 1_024,
   maxCommands: 5,
 } as const;
@@ -24,7 +24,7 @@ type OverallValidationStatus = "passed" | "failed" | "partial" | "unable_to_vali
 type InstallStatus = "passed" | "failed" | "skipped";
 type CheckName = "typecheck" | "lint" | "test" | "build";
 type CheckStatus = "passed" | "failed" | "skipped" | "timed_out";
-export type ProposedFixValidationPartialReason = "skipped_checks" | "no_lockfile_fallback" | "cleanup_unconfirmed";
+export type ProposedFixValidationPartialReason = "skipped_checks" | "no_lockfile_fallback" | "cleanup_unconfirmed" | "validation_timeout";
 const CHECK_NAMES: CheckName[] = ["typecheck", "lint", "test", "build"];
 
 export type ProposedFixValidationResult = {

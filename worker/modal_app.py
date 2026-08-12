@@ -76,6 +76,19 @@ SANDBOX_COMMAND_ENV = {
 MAX_SAFE_SDK_REASON_CHARS = 240
 MAX_RESULT_SUMMARY_CHARS = 1_000
 TRUNCATED_OUTPUT_NOTICE = "Command output was truncated at the 24 KiB diagnostic limit."
+# The Modal function has a hard five-minute limit. Keep a small, explicit
+# reserve so termination, result signing, and response delivery are not
+# competing with an in-flight repository command at that deadline.
+TOTAL_VALIDATION_DURATION_SECONDS = 300
+CLEANUP_RESERVE_SECONDS = 20
+VALIDATION_EXECUTION_BUDGET_SECONDS = TOTAL_VALIDATION_DURATION_SECONDS - CLEANUP_RESERVE_SECONDS
+SETUP_COMMAND_TIMEOUT_SECONDS = 90
+CHECK_TIMEOUT_SECONDS = {
+    "typecheck": 45,
+    "lint": 60,
+    "test": 120,
+    "build": 75,
+}
 ANSI_ESCAPE_RE = re.compile(
     r"\x1B(?:\][^\x07\x1B]*(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~]|[()#][0-2AB]|[@-_])"
 )
@@ -137,11 +150,12 @@ def web():
 async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
     # urllib is only used for the trusted outer-worker GitHub fetch. Modal
     # operations below always use the SDK's native async .aio interface.
+    started = time.monotonic()
+    validation_deadline = started + VALIDATION_EXECUTION_BUDGET_SECONDS
     archive = await asyncio.to_thread(fetch_verified_archive, job)
     await asyncio.to_thread(inspect_github_zip, archive)
     sandbox = None
     result: dict[str, Any] | None = None
-    started = time.monotonic()
     try:
         sandbox = await create_sandbox(job)
         await upload_sandbox_inputs(sandbox, archive, job)
@@ -150,8 +164,12 @@ async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
         lockfile_synchronized = False
         if manager == "npm" and job["proposedFix"]["packageJsonChange"]["required"]:
             await verify_npm_lockfile_binding(sandbox, job)
-            lockfile_sync = await run_command(sandbox, npm_lockfile_sync_argv(), 90)
-            if lockfile_sync["status"] != "passed":
+            lockfile_sync_timeout = command_timeout_seconds(validation_deadline, SETUP_COMMAND_TIMEOUT_SECONDS)
+            if lockfile_sync_timeout == 0:
+                result = time_budget_result(job)
+            else:
+                lockfile_sync = await run_command(sandbox, npm_lockfile_sync_argv(), lockfile_sync_timeout)
+            if result is None and lockfile_sync["status"] != "passed":
                 result = completed_result(
                     job,
                     "failed",
@@ -160,38 +178,42 @@ async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
                     ["lockfile_update_failed"],
                     [],
                 )
-            else:
+            elif result is None:
                 # `npm install --package-lock-only` must not be allowed to
                 # alter the authorized package.json edit while it resolves the
                 # transitive graph. Recheck the exact server-authorized value.
                 await verify_npm_lockfile_binding(sandbox, job)
                 lockfile_synchronized = True
         if result is None:
-            install = await run_command(sandbox, install_argv(manager), 90)
-            if install["status"] != "passed":
-                result = completed_result(job, "failed", {"status": "failed", "summary": install["summary"]}, skipped_checks("Not run because dependency installation failed."), ["dependency_install_failed"], [])
+            install_timeout = command_timeout_seconds(validation_deadline, SETUP_COMMAND_TIMEOUT_SECONDS)
+            if install_timeout == 0:
+                result = time_budget_result(job)
             else:
+                install = await run_command(sandbox, install_argv(manager), install_timeout)
+            if result is None and install["status"] != "passed":
+                result = completed_result(job, "failed", {"status": "failed", "summary": install["summary"]}, skipped_checks("Not run because dependency installation failed."), ["dependency_install_failed"], [])
+            elif result is None:
                 await disable_sandbox_egress(sandbox)
-                checks = []
-                for name in CHECK_NAMES:
-                    if time.monotonic() - started >= 300:
-                        checks.extend(skipped_checks("Not run because the total job deadline was reached.", names=CHECK_NAMES[len(checks) :]))
-                        result = completed_result(job, "partial", {"status": "passed", "summary": install_summary(lockfile_synchronized)}, checks, ["total_deadline_reached"], ["skipped_checks"])
-                        break
-                    if not await has_package_script(sandbox, name):
-                        checks.append({"name": name, "status": "skipped", "durationMs": 0, "summary": "No package script is defined."})
-                        continue
-                    checks.append(await run_command(sandbox, [manager, "run", name, "--if-present"], 90, name=name))
-                    if checks[-1]["status"] in {"failed", "timed_out"}:
-                        checks.extend(skipped_checks("Not run after a failed check.", names=CHECK_NAMES[len(checks) :]))
-                        result = completed_result(job, "failed", {"status": "passed", "summary": install_summary(lockfile_synchronized)}, checks, ["validation_check_failed"], [])
-                        break
-                if result is None:
-                    skipped = any(check["status"] == "skipped" for check in checks)
-                    warnings = ["package_lock_synchronized_in_sandbox"] if lockfile_synchronized else []
-                    if skipped:
+                checks, timed_out, deadline_reached, failed, missing_script = await run_validation_checks(sandbox, manager, validation_deadline)
+                skipped = any(check["status"] == "skipped" for check in checks)
+                warnings = ["package_lock_synchronized_in_sandbox"] if lockfile_synchronized else []
+                partial_reasons: list[str] = []
+                if failed:
+                    warnings.append("validation_check_failed")
+                    overall = "failed"
+                elif timed_out or deadline_reached:
+                    warnings.append("validation_check_timed_out" if timed_out else "validation_time_budget_exhausted")
+                    partial_reasons.append("validation_timeout")
+                    overall = "partial"
+                elif skipped:
+                    overall = "partial"
+                else:
+                    overall = "passed"
+                if skipped and not failed:
+                    if missing_script:
                         warnings.append("one_or_more_allowlisted_checks_not_defined")
-                    result = completed_result(job, "partial" if skipped else "passed", {"status": "passed", "summary": install_summary(lockfile_synchronized)}, checks, warnings, ["skipped_checks"] if skipped else [])
+                    partial_reasons.append("skipped_checks")
+                result = completed_result(job, overall, {"status": "passed", "summary": install_summary(lockfile_synchronized)}, checks, warnings, partial_reasons)
     finally:
         if sandbox is not None:
             cleanup_succeeded = await cleanup_sandbox(sandbox)
@@ -407,6 +429,52 @@ def install_summary(lockfile_synchronized: bool) -> str:
     return "Installed with scripts disabled."
 
 
+def command_timeout_seconds(deadline: float, requested_timeout_seconds: int) -> int:
+    """Bound every command by both its own cap and the shared job budget."""
+    remaining = int(deadline - time.monotonic())
+    return max(0, min(requested_timeout_seconds, remaining))
+
+
+def time_budget_result(job: dict[str, Any]) -> dict[str, Any]:
+    return completed_result(
+        job,
+        "partial",
+        {"status": "skipped", "summary": "Dependency installation was not started because the isolated validation time budget was exhausted."},
+        skipped_checks("Not run because insufficient time remained in the total validation budget."),
+        ["validation_time_budget_exhausted"],
+        ["validation_timeout", "skipped_checks"],
+    )
+
+
+async def run_validation_checks(sandbox, manager: str, deadline: float) -> tuple[list[dict[str, Any]], bool, bool, bool, bool]:
+    """Run independent allowlisted checks without treating a timeout as failure.
+
+    Returns checks plus flags for a timed-out check, exhausted shared budget,
+    a definitive check failure, and scripts that were not defined.
+    """
+    checks: list[dict[str, Any]] = []
+    timed_out = deadline_reached = failed = missing_script = False
+    for index, name in enumerate(CHECK_NAMES):
+        timeout_seconds = command_timeout_seconds(deadline, CHECK_TIMEOUT_SECONDS[name])
+        if timeout_seconds == 0:
+            checks.extend(skipped_checks("Not run because insufficient time remained in the total validation budget.", names=CHECK_NAMES[index:]))
+            deadline_reached = True
+            break
+        if not await has_package_script(sandbox, name):
+            checks.append({"name": name, "status": "skipped", "durationMs": 0, "summary": "No package script is defined."})
+            missing_script = True
+            continue
+        check = await run_command(sandbox, [manager, "run", name, "--if-present"], timeout_seconds, name=name)
+        checks.append(check)
+        if check["status"] == "failed":
+            checks.extend(skipped_checks("Not run after a failed check.", names=CHECK_NAMES[index + 1 :]))
+            failed = True
+            break
+        if check["status"] == "timed_out":
+            timed_out = True
+    return checks, timed_out, deadline_reached, failed, missing_script
+
+
 async def run_command(sandbox, argv: list[str], timeout_seconds: int, *, name: str | None = None) -> dict[str, Any]:
     started = time.monotonic()
     try:
@@ -426,9 +494,10 @@ async def run_command(sandbox, argv: list[str], timeout_seconds: int, *, name: s
         output = await read_bounded_output(process)
         exit_code = await process.wait.aio()
     except TimeoutError:
-        # A command reaching its fixed 90-second execution limit is a normal
+        # A command reaching its execution limit is a normal
         # validation outcome, not a worker orchestration failure.
-        output = "Command did not complete before its execution limit."
+        check_label = {"typecheck": "Typecheck", "lint": "Lint", "test": "Tests", "build": "Build"}.get(name or "", "This check")
+        output = f"{check_label} exceeded the isolated validation time budget." if name is not None else "Dependency installation did not complete before its execution limit."
         exit_code = 1
         timed_out = True
     except Exception as error:
@@ -437,11 +506,11 @@ async def run_command(sandbox, argv: list[str], timeout_seconds: int, *, name: s
     if not isinstance(exit_code, int) or isinstance(exit_code, bool):
         log_sandbox_failure("sandbox_result_invalid")
         raise ValidationError("sandbox_result_invalid")
-    duration = min(int((time.monotonic() - started) * 1000), 90000)
+    duration = min(int((time.monotonic() - started) * 1000), timeout_seconds * 1000)
     summary = output or ("Completed." if exit_code == 0 else "Command failed without output.")
     if name is None:
         return {"status": "passed" if exit_code == 0 else "failed", "summary": summary}
-    status = "passed" if exit_code == 0 else ("timed_out" if timed_out or duration >= 89_000 else "failed")
+    status = "passed" if exit_code == 0 else ("timed_out" if timed_out else "failed")
     return {"name": name, "status": status, "durationMs": duration, "summary": summary}
 
 

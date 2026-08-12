@@ -33,7 +33,7 @@ OWNER_RE = re.compile(r"^[A-Za-z0-9-]{1,39}$")
 
 POLICY: dict[str, Any] = {
     "version": 1,
-    "execution": {"nonRoot": True, "privileged": False, "readOnlyRootFilesystem": True, "ephemeralWorkspace": True, "cpuMillicores": 1000, "memoryMiB": 2048, "maxDurationMs": 300000, "maxCommandDurationMs": 90000, "maxCommandOutputBytes": 24576},
+    "execution": {"nonRoot": True, "privileged": False, "readOnlyRootFilesystem": True, "ephemeralWorkspace": True, "cpuMillicores": 1000, "memoryMiB": 2048, "maxDurationMs": 300000, "maxCommandDurationMs": 120000, "maxCommandOutputBytes": 24576},
     "archive": {"maxCompressedBytes": MAX_ARCHIVE_COMPRESSED_BYTES, "maxExtractedBytes": MAX_ARCHIVE_EXTRACTED_BYTES, "rejectAbsolutePaths": True, "rejectParentTraversal": True, "rejectSymlinks": True},
     "network": {"install": {"mode": "allowlist", "hosts": ["registry.npmjs.org", "registry.yarnpkg.com"]}, "checks": {"mode": "disabled"}},
     "installScripts": "disabled",

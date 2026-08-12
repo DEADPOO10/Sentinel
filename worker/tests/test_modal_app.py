@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from worker.core import CHECK_NAMES, MAX_COMMAND_OUTPUT_BYTES, POLICY, ValidationError, canonical_json, sign, verify_signature
-from worker.modal_app import MAX_RESULT_SUMMARY_CHARS, SANDBOX_AGENT_REMOTE_PATH, SANDBOX_USER_PREFIX, TRUNCATED_OUTPUT_NOTICE, cleanup_sandbox, create_api, execute_job, install_argv, normalize_command_output, npm_lockfile_sync_argv, read_bounded_output, trusted_sandbox_agent_path
+from worker.modal_app import CHECK_TIMEOUT_SECONDS, CLEANUP_RESERVE_SECONDS, MAX_RESULT_SUMMARY_CHARS, SANDBOX_AGENT_REMOTE_PATH, SANDBOX_USER_PREFIX, TOTAL_VALIDATION_DURATION_SECONDS, TRUNCATED_OUTPUT_NOTICE, VALIDATION_EXECUTION_BUDGET_SECONDS, cleanup_sandbox, command_timeout_seconds, create_api, execute_job, install_argv, normalize_command_output, npm_lockfile_sync_argv, read_bounded_output, run_validation_checks, trusted_sandbox_agent_path
 
 
 def valid_job():
@@ -58,6 +58,12 @@ class FakeProcess:
     def __init__(self, *, exit_code=0, output=""):
         self.stdout = FakeStdout([output] if output else [])
         self.wait = AioOnlyCall(return_value=exit_code)
+
+
+class TimedOutProcess(FakeProcess):
+    def __init__(self, *, output=""):
+        super().__init__(output=output)
+        self.wait = AioOnlyCall(side_effect=TimeoutError())
 
 
 class FakeSandbox:
@@ -349,6 +355,130 @@ class ModalAsyncExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[:3], ["lockfile_sync", "clean_install", "egress_locked"])
         self.assertTrue(all(events.index("egress_locked") < index for index, value in enumerate(events) if value.startswith("script:")))
 
+    async def test_timed_out_test_is_partial_and_later_build_continues(self):
+        sandbox = FakeSandbox()
+        executed: list[str] = []
+
+        async def record_command(_sandbox, argv, _timeout, *, name=None):
+            if name is None:
+                return {"status": "passed", "summary": "installed"}
+            executed.append(name)
+            return {"name": name, "status": "timed_out" if name == "test" else "passed", "durationMs": 1, "summary": "Tests exceeded the isolated validation time budget." if name == "test" else "passed"}
+
+        with patch("worker.modal_app.fetch_verified_archive", return_value=b"checked archive"), patch(
+            "worker.modal_app.inspect_github_zip"
+        ), patch("worker.modal_app.create_sandbox", new=AsyncMock(return_value=sandbox)), patch(
+            "worker.modal_app.trusted_sandbox_agent_path", return_value=Path("/opt/sentinel/worker/sandbox_agent.py")
+        ), patch("worker.modal_app.run_command", new=record_command):
+            result = await execute_job(valid_job())
+
+        self.assertEqual(executed, list(CHECK_NAMES))
+        self.assertEqual(result["overallStatus"], "partial")
+        self.assertIn("validation_timeout", result["partialReasons"])
+        self.assertIn("validation_check_timed_out", result["warnings"])
+        self.assertEqual(result["checks"][2]["status"], "timed_out")
+        self.assertEqual(result["checks"][3]["status"], "passed")
+
+    async def test_failed_check_remains_failed_even_after_an_earlier_timeout(self):
+        sandbox = FakeSandbox()
+
+        async def record_command(_sandbox, argv, _timeout, *, name=None):
+            if name is None:
+                return {"status": "passed", "summary": "installed"}
+            status = "timed_out" if name == "test" else ("failed" if name == "build" else "passed")
+            return {"name": name, "status": status, "durationMs": 1, "summary": "result"}
+
+        with patch("worker.modal_app.fetch_verified_archive", return_value=b"checked archive"), patch(
+            "worker.modal_app.inspect_github_zip"
+        ), patch("worker.modal_app.create_sandbox", new=AsyncMock(return_value=sandbox)), patch(
+            "worker.modal_app.trusted_sandbox_agent_path", return_value=Path("/opt/sentinel/worker/sandbox_agent.py")
+        ), patch("worker.modal_app.run_command", new=record_command):
+            result = await execute_job(valid_job())
+
+        self.assertEqual(result["overallStatus"], "failed")
+        self.assertIn("validation_check_failed", result["warnings"])
+        self.assertNotIn("validation_timeout", result["partialReasons"])
+        self.assertEqual(result["checks"][2]["status"], "timed_out")
+        self.assertEqual(result["checks"][3]["status"], "failed")
+
+    async def test_global_budget_skips_remaining_checks_without_running_scripts(self):
+        sandbox = FakeSandbox()
+        checks, timed_out, deadline_reached, failed, missing_script = await run_validation_checks(
+            sandbox, "npm", time.monotonic() - 1
+        )
+
+        self.assertTrue(deadline_reached)
+        self.assertFalse(timed_out)
+        self.assertFalse(failed)
+        self.assertFalse(missing_script)
+        self.assertEqual([check["status"] for check in checks], ["skipped"] * len(CHECK_NAMES))
+        self.assertEqual(sandbox.exec.aio.await_count, 0)
+
+    async def test_lint_failure_stops_later_checks_as_a_definitive_failure(self):
+        sandbox = FakeSandbox()
+        executed: list[str] = []
+
+        async def record_command(_sandbox, _argv, _timeout, *, name=None):
+            executed.append(name or "setup")
+            return {"name": name, "status": "failed" if name == "lint" else "passed", "durationMs": 1, "summary": "result"}
+
+        with patch("worker.modal_app.has_package_script", new=AsyncMock(return_value=True)), patch(
+            "worker.modal_app.run_command", new=record_command
+        ):
+            checks, _timed_out, _deadline_reached, failed, _missing_script = await run_validation_checks(
+                sandbox, "npm", time.monotonic() + 1_000
+            )
+
+        self.assertEqual(executed, ["typecheck", "lint"])
+        self.assertTrue(failed)
+        self.assertEqual([check["status"] for check in checks], ["passed", "failed", "skipped", "skipped"])
+
+    async def test_missing_typecheck_script_is_skipped_without_running_it(self):
+        sandbox = FakeSandbox()
+        executed: list[str] = []
+
+        async def has_script(_sandbox, name):
+            return name != "typecheck"
+
+        async def record_command(_sandbox, _argv, _timeout, *, name=None):
+            executed.append(name)
+            return {"name": name, "status": "passed", "durationMs": 1, "summary": "passed"}
+
+        with patch("worker.modal_app.has_package_script", new=has_script), patch(
+            "worker.modal_app.run_command", new=record_command
+        ):
+            checks, _timed_out, _deadline_reached, _failed, missing_script = await run_validation_checks(
+                sandbox, "npm", time.monotonic() + 1_000
+            )
+
+        self.assertTrue(missing_script)
+        self.assertEqual(checks[0]["status"], "skipped")
+        self.assertEqual(executed, ["lint", "test", "build"])
+
+    async def test_test_failure_is_a_definitive_failure(self):
+        sandbox = FakeSandbox()
+
+        async def record_command(_sandbox, _argv, _timeout, *, name=None):
+            return {"name": name, "status": "failed" if name == "test" else "passed", "durationMs": 1, "summary": "result"}
+
+        with patch("worker.modal_app.has_package_script", new=AsyncMock(return_value=True)), patch(
+            "worker.modal_app.run_command", new=record_command
+        ):
+            checks, timed_out, _deadline_reached, failed, _missing_script = await run_validation_checks(
+                sandbox, "npm", time.monotonic() + 1_000
+            )
+
+        self.assertTrue(failed)
+        self.assertFalse(timed_out)
+        self.assertEqual([check["status"] for check in checks], ["passed", "passed", "failed", "skipped"])
+
+    def test_command_timeouts_are_capped_and_leave_cleanup_reserve(self):
+        self.assertEqual(TOTAL_VALIDATION_DURATION_SECONDS - VALIDATION_EXECUTION_BUDGET_SECONDS, CLEANUP_RESERVE_SECONDS)
+        with patch("worker.modal_app.time.monotonic", return_value=100.0):
+            self.assertEqual(command_timeout_seconds(220.0, CHECK_TIMEOUT_SECONDS["test"]), 120)
+            self.assertEqual(command_timeout_seconds(101.0, CHECK_TIMEOUT_SECONDS["test"]), 1)
+            self.assertEqual(command_timeout_seconds(100.0, CHECK_TIMEOUT_SECONDS["test"]), 0)
+
     async def test_trusted_agent_lockfile_binding_exit_becomes_safe_lockfile_failure(self):
         sandbox = FakeSandbox()
         sandbox.exec = AioOnlyCall(side_effect=[FakeProcess(exit_code=3, output="")])
@@ -415,6 +545,16 @@ class ModalAsyncExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(TRUNCATED_OUTPUT_NOTICE, output)
         self.assertLessEqual(len(output), MAX_RESULT_SUMMARY_CHARS)
+
+    async def test_timed_out_command_summary_is_bounded_and_ansi_clean(self):
+        sandbox = SimpleNamespace(exec=AioOnlyCall(return_value=TimedOutProcess(output="\x1b[31mverbose output\x1b[0m")))
+        from worker import modal_app
+
+        result = await modal_app.run_command(sandbox, ["npm", "run", "test", "--if-present"], 120, name="test")
+
+        self.assertEqual(result["status"], "timed_out")
+        self.assertLessEqual(len(result["summary"]), MAX_RESULT_SUMMARY_CHARS)
+        self.assertNotIn("\x1b", result["summary"])
 
     def test_command_output_removes_ansi_and_control_sequences(self):
         output = normalize_command_output("\x1b[1G\x1b[0K\x1b[31mnpm error\x1b[39m\r\nnext\x07\ufffd[1G")

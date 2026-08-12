@@ -7,12 +7,12 @@ export const MAX_WORKER_TEXT_LENGTH = 1_000;
 const CHECK_NAMES = ["typecheck", "lint", "test", "build"] as const;
 const CHECK_STATUSES = ["passed", "failed", "skipped", "timed_out"] as const;
 const OVERALL_STATUSES = ["passed", "failed", "partial", "unable_to_validate"] as const;
-const PARTIAL_REASONS = ["skipped_checks", "no_lockfile_fallback", "cleanup_unconfirmed"] as const;
+const PARTIAL_REASONS = ["skipped_checks", "no_lockfile_fallback", "cleanup_unconfirmed", "validation_timeout"] as const;
 
 /** This policy is sent to every provider and must be enforced by the worker. */
 export const VALIDATION_WORKER_POLICY = {
   version: 1,
-  execution: { nonRoot: true, privileged: false, readOnlyRootFilesystem: true, ephemeralWorkspace: true, cpuMillicores: 1_000, memoryMiB: 2_048, maxDurationMs: VALIDATION_WORKER_MAX_DURATION_MS, maxCommandDurationMs: 90 * 1_000, maxCommandOutputBytes: 24 * 1_024 },
+  execution: { nonRoot: true, privileged: false, readOnlyRootFilesystem: true, ephemeralWorkspace: true, cpuMillicores: 1_000, memoryMiB: 2_048, maxDurationMs: VALIDATION_WORKER_MAX_DURATION_MS, maxCommandDurationMs: 120 * 1_000, maxCommandOutputBytes: 24 * 1_024 },
   archive: { maxCompressedBytes: 25 * 1_024 * 1_024, maxExtractedBytes: 100 * 1_024 * 1_024, rejectAbsolutePaths: true, rejectParentTraversal: true, rejectSymlinks: true },
   network: { install: { mode: "allowlist", hosts: ["registry.npmjs.org", "registry.yarnpkg.com"] }, checks: { mode: "disabled" } },
   installScripts: "disabled",

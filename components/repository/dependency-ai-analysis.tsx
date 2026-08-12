@@ -166,7 +166,7 @@ function ValidationStage({ name, status, durationMs, summary }: { name: string; 
 
 function StatusPill({ value }: { value: string }) {
   const normalized = value.replaceAll("_", " ");
-  const classes = value === "passed" ? "bg-emerald-50 text-emerald-800" : value === "failed" || value === "timed_out" ? "bg-rose-50 text-rose-800" : "bg-amber-100 text-amber-800";
+  const classes = value === "passed" ? "bg-emerald-50 text-emerald-800" : value === "failed" ? "bg-rose-50 text-rose-800" : "bg-amber-100 text-amber-800";
   return <span className={`rounded-none px-2 py-1 text-[11px] font-medium uppercase ${classes}`}>{normalized}</span>;
 }
 

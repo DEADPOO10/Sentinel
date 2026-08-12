@@ -11,7 +11,7 @@ This repository includes a Modal implementation at `worker/modal_app.py`. It is 
 For every job, the worker must enforce the policy sent in `lib/validation/worker-contract.ts`:
 
 - an ephemeral workspace and non-root UID; no privileged container, host mounts, Docker socket, or writable root filesystem;
-- 1 vCPU, 2 GiB memory, five-minute total deadline, 90-second command deadline, and 24 KiB output cap per command;
+- 1 vCPU, 2 GiB memory, a five-minute total deadline, and a 24 KiB output cap per command. The worker reserves 20 seconds for cleanup/signing and bounds commands by the remaining shared budget: typecheck 45 seconds, lint 60 seconds, tests 120 seconds, and build 75 seconds;
 - bounded archive download/extraction; reject absolute paths, `..`, symlinks, and over-size archives before writing files;
 - package-manager argv allowlists only: never use a shell or accept arbitrary repository commands;
 - dependency-install scripts disabled; registry-only network during installation, then network disabled for typecheck, lint, test, and build;
