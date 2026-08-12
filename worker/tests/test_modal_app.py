@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from worker.core import CHECK_NAMES, MAX_COMMAND_OUTPUT_BYTES, POLICY, ValidationError, canonical_json, sign, verify_signature
-from worker.modal_app import SANDBOX_AGENT_REMOTE_PATH, SANDBOX_USER_PREFIX, cleanup_sandbox, create_api, execute_job, install_argv, normalize_command_output, npm_lockfile_sync_argv, read_bounded_output, trusted_sandbox_agent_path
+from worker.modal_app import MAX_RESULT_SUMMARY_CHARS, SANDBOX_AGENT_REMOTE_PATH, SANDBOX_USER_PREFIX, TRUNCATED_OUTPUT_NOTICE, cleanup_sandbox, create_api, execute_job, install_argv, normalize_command_output, npm_lockfile_sync_argv, read_bounded_output, trusted_sandbox_agent_path
 
 
 def valid_job():
@@ -413,8 +413,8 @@ class ModalAsyncExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_verbose_output_is_drained_and_truncated_without_a_sandbox_kill(self):
         output = await read_bounded_output(FakeProcess(output="x" * (MAX_COMMAND_OUTPUT_BYTES + 1)))
 
-        self.assertIn("Command output was truncated at the 24 KiB diagnostic limit.", output)
-        self.assertLessEqual(len(output), 1_100)
+        self.assertIn(TRUNCATED_OUTPUT_NOTICE, output)
+        self.assertLessEqual(len(output), MAX_RESULT_SUMMARY_CHARS)
 
     def test_command_output_removes_ansi_and_control_sequences(self):
         output = normalize_command_output("\x1b[1G\x1b[0K\x1b[31mnpm error\x1b[39m\r\nnext\x07\ufffd[1G")

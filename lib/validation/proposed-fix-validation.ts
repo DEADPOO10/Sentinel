@@ -1,11 +1,11 @@
 import "server-only";
 
 import type { ProposedFix } from "@/lib/openai/proposed-fix";
+import { parseSignedWorkerResponse, workerResponseBindingFailure } from "@/lib/validation/worker-response";
 import {
   MAX_WORKER_RESPONSE_BYTES,
   VALIDATION_WORKER_MAX_DURATION_MS,
   VALIDATION_WORKER_POLICY,
-  isSafeWorkerResult,
   signWorkerMessageSignature,
   workerHttpErrorDiagnostics,
   verifyWorkerMessageSignature,
@@ -73,8 +73,9 @@ export async function validateProposedFixInTemporaryWorkspace(input: ValidationI
 
   try {
     const result = await invokeValidationWorker(configResult.config, request);
-    if (!result || result.jobId !== jobId || result.repository.commitSha.toLowerCase() !== input.baseCommitSha.toLowerCase()) {
-      logSafeValidationEvent("worker_response_rejected", { reason: "invalid_or_unbound_result" });
+    const bindingFailure = workerResponseBindingFailure(result, jobId, input.baseCommitSha);
+    if (bindingFailure) {
+      logSafeValidationEvent("worker_response_rejected", { reason: bindingFailure });
       return withBase(createUnableToValidateResult("The isolated validation worker returned an invalid result."), input);
     }
     return withBase(normalizeWorkerResult(result), input);
@@ -149,11 +150,9 @@ async function invokeValidationWorker(config: WorkerConfig, request: ValidationW
     if (Number.isFinite(declaredLength) && declaredLength > MAX_WORKER_RESPONSE_BYTES) throw new ValidationWorkerError("response_too_large");
     const responseBody = await response.text();
     if (Buffer.byteLength(responseBody) > MAX_WORKER_RESPONSE_BYTES) throw new ValidationWorkerError("oversized_response");
-    const signature = response.headers.get("x-sentinel-worker-signature");
-    if (!signature || !verifyPayloadSignature(config.sharedSecret, responseBody, signature)) throw new ValidationWorkerError("invalid_signature");
-    const parsed: unknown = JSON.parse(responseBody);
-    if (!isSafeWorkerResult(parsed)) throw new ValidationWorkerError("invalid_result");
-    return parsed;
+    const parsed = parseSignedWorkerResponse(config.sharedSecret, responseBody, response.headers.get("x-sentinel-worker-signature"));
+    if (parsed.kind === "invalid") throw new ValidationWorkerError(parsed.reason, parsed.diagnostics);
+    return parsed.result;
   } catch (error) {
     if (error instanceof ValidationWorkerError) throw error;
     throw new ValidationWorkerError(getWorkerFetchFailureReason(error));
@@ -179,7 +178,6 @@ function withBase(result: ProposedFixValidationResult, input: Pick<ValidationInp
 function isSafeGitCommitSha(value: string) { return /^[a-f\d]{40,64}$/i.test(value); }
 function signPayload(secret: string, payload: string) { return signWorkerMessageSignature(secret, payload); }
 export function verifyWorkerResponseSignature(secret: string, payload: string, signature: string) { return verifyWorkerMessageSignature(secret, payload, signature); }
-function verifyPayloadSignature(secret: string, payload: string, signature: string) { return verifyWorkerMessageSignature(secret, payload, signature); }
 function getWorkerFetchFailureReason(error: unknown) {
   if (error instanceof DOMException && error.name === "AbortError") return "timeout";
   const code = getErrorCode(error);
@@ -194,11 +192,13 @@ function getErrorCode(error: unknown) {
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null; }
 class ValidationWorkerError extends Error {
-  constructor(
-    readonly reason: string,
-    readonly diagnostics: Record<string, string> = {},
-  ) {
+  readonly reason: string;
+  readonly diagnostics: Record<string, string>;
+
+  constructor(reason: string, diagnostics: Record<string, string> = {}) {
     super(reason);
+    this.reason = reason;
+    this.diagnostics = diagnostics;
   }
 }
 function logSafeValidationEvent(event: string, details: Record<string, string>) { console.error("[sentinel:validation-worker]", event, details); }

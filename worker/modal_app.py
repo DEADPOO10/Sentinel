@@ -74,6 +74,8 @@ SANDBOX_COMMAND_ENV = {
     "npm_config_fund": "false",
 }
 MAX_SAFE_SDK_REASON_CHARS = 240
+MAX_RESULT_SUMMARY_CHARS = 1_000
+TRUNCATED_OUTPUT_NOTICE = "Command output was truncated at the 24 KiB diagnostic limit."
 ANSI_ESCAPE_RE = re.compile(
     r"\x1B(?:\][^\x07\x1B]*(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~]|[()#][0-2AB]|[@-_])"
 )
@@ -462,9 +464,10 @@ async def read_bounded_output(process) -> str:
             continue
         fragments.append(line)
         size += len(encoded)
-    output = normalize_command_output("".join(fragments)).strip()[:1000]
+    output = normalize_command_output("".join(fragments)).strip()[:MAX_RESULT_SUMMARY_CHARS]
     if truncated:
-        return (output + "\nCommand output was truncated at the 24 KiB diagnostic limit.").strip()
+        prefix_limit = MAX_RESULT_SUMMARY_CHARS - len(TRUNCATED_OUTPUT_NOTICE) - 1
+        return (output[:prefix_limit].rstrip() + "\n" + TRUNCATED_OUTPUT_NOTICE).strip()
     return output or "Completed without output."
 
 
