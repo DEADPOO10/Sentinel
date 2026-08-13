@@ -8,6 +8,7 @@ import {
   createDraftPullRequestPayload,
   createSentinelBranchName,
   getAuthorizedDraftPrChangeFailure,
+  getAuthorizedDraftPrFilePaths,
   isDraftPrValidationEligible,
   isDraftPullRequestCreationEnabled,
   isMatchingSentinelPullRequest,
@@ -86,10 +87,22 @@ test("the authorized V1 change surface is package.json only and rejects stale lo
   assert.equal(getAuthorizedDraftPrChangeFailure(proposal, ["package.json", "src/app.ts"]), null);
   assert.equal(getAuthorizedDraftPrChangeFailure({ ...proposal, files: [{ path: "src/app.ts" }] }, ["package.json"]), "source_changes_not_allowed");
   assert.equal(getAuthorizedDraftPrChangeFailure({ files: [], packageJsonChange: { ...packageChange, required: false } }, ["package.json"]), "package_json_change_required");
-  for (const lockfile of ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"]) {
+  assert.equal(getAuthorizedDraftPrChangeFailure(proposal, ["package.json", "package-lock.json"]), "validated_lockfile_required");
+  for (const lockfile of ["npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"]) {
     assert.equal(getAuthorizedDraftPrChangeFailure(proposal, ["package.json", lockfile]), "lockfile_artifact_required", lockfile);
   }
   assert.equal(getAuthorizedDraftPrChangeFailure(proposal, ["packages/example/package-lock.json"]), null);
+});
+
+test("the authorized file map is exactly package.json or package.json plus a verified npm lockfile", () => {
+  const proposal = { files: [], packageJsonChange: packageChange };
+  const artifact = { kind: "npm_package_lock" as const, path: "package-lock.json" as const };
+  assert.deepEqual(getAuthorizedDraftPrFilePaths(proposal, ["package.json"], null), { kind: "authorized", paths: ["package.json"] });
+  assert.deepEqual(getAuthorizedDraftPrFilePaths(proposal, ["package.json", "package-lock.json"], artifact), { kind: "authorized", paths: ["package.json", "package-lock.json"] });
+  assert.deepEqual(getAuthorizedDraftPrFilePaths(proposal, ["package.json", "package-lock.json"], null), { kind: "rejected", category: "validated_lockfile_required" });
+  assert.deepEqual(getAuthorizedDraftPrFilePaths(proposal, ["package.json"], artifact), { kind: "rejected", category: "validated_lockfile_invalid" });
+  assert.deepEqual(getAuthorizedDraftPrFilePaths(proposal, ["package.json", "pnpm-lock.yaml"], artifact), { kind: "rejected", category: "lockfile_artifact_required" });
+  assert.deepEqual(getAuthorizedDraftPrFilePaths({ ...proposal, files: [{ path: "src/index.ts" }] }, ["package.json", "package-lock.json"], artifact), { kind: "rejected", category: "source_changes_not_allowed" });
 });
 
 test("package.json update requires an exact server-revalidated dependency value and section", () => {

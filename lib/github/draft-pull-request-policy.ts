@@ -17,6 +17,8 @@ export type DraftPrPublicErrorCategory =
   | "proposed_fix_stale"
   | "source_changes_not_allowed"
   | "lockfile_artifact_required"
+  | "validated_lockfile_required"
+  | "validated_lockfile_invalid"
   | "github_write_permission_required"
   | "branch_conflict"
   | "github_write_failed";
@@ -90,13 +92,30 @@ export function isDraftPrValidationEligible(result: DraftPrValidation | null | u
 export function getAuthorizedDraftPrChangeFailure(
   proposal: DraftPrProposal,
   repositoryPaths: Iterable<string>,
-): "source_changes_not_allowed" | "package_json_change_required" | "lockfile_artifact_required" | null {
-  if (proposal.files.length > 0) return "source_changes_not_allowed";
-  if (!proposal.packageJsonChange.required) return "package_json_change_required";
-  for (const path of repositoryPaths) {
-    if (DRAFT_PR_SUPPORTED_ROOT_LOCKFILES.has(path)) return "lockfile_artifact_required";
+  validatedPackageLockArtifact: { kind: "npm_package_lock"; path: "package-lock.json" } | null = null,
+): "source_changes_not_allowed" | "package_json_change_required" | "lockfile_artifact_required" | "validated_lockfile_required" | "validated_lockfile_invalid" | null {
+  const authorization = getAuthorizedDraftPrFilePaths(proposal, repositoryPaths, validatedPackageLockArtifact);
+  return authorization.kind === "authorized" ? null : authorization.category;
+}
+
+export function getAuthorizedDraftPrFilePaths(
+  proposal: DraftPrProposal,
+  repositoryPaths: Iterable<string>,
+  validatedPackageLockArtifact: { kind: "npm_package_lock"; path: "package-lock.json" } | null = null,
+): { kind: "authorized"; paths: ["package.json"] | ["package.json", "package-lock.json"] } | { kind: "rejected"; category: "source_changes_not_allowed" | "package_json_change_required" | "lockfile_artifact_required" | "validated_lockfile_required" | "validated_lockfile_invalid" } {
+  if (proposal.files.length > 0) return { kind: "rejected", category: "source_changes_not_allowed" };
+  if (!proposal.packageJsonChange.required) return { kind: "rejected", category: "package_json_change_required" };
+  const rootPaths = new Set(repositoryPaths);
+  const hasNpmPackageLock = rootPaths.has("package-lock.json");
+  const hasUnsupportedLockfile = [...DRAFT_PR_SUPPORTED_ROOT_LOCKFILES].some((path) => path !== "package-lock.json" && rootPaths.has(path));
+  if (hasUnsupportedLockfile) return { kind: "rejected", category: "lockfile_artifact_required" };
+  if (hasNpmPackageLock && !validatedPackageLockArtifact) return { kind: "rejected", category: "validated_lockfile_required" };
+  if (!hasNpmPackageLock && validatedPackageLockArtifact) return { kind: "rejected", category: "validated_lockfile_invalid" };
+  if (hasNpmPackageLock) {
+    if (validatedPackageLockArtifact?.kind !== "npm_package_lock" || validatedPackageLockArtifact.path !== "package-lock.json") return { kind: "rejected", category: "validated_lockfile_invalid" };
+    return { kind: "authorized", paths: ["package.json", "package-lock.json"] };
   }
-  return null;
+  return { kind: "authorized", paths: ["package.json"] };
 }
 
 export function updateAuthorizedPackageJson(

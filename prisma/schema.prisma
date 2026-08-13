@@ -202,6 +202,9 @@ model ValidationRun {
   testStatus      ValidationStageStatus?
   buildStatus     ValidationStageStatus?
   warningsJson    Json
+  npmPackageLockContent Bytes?
+  npmPackageLockByteLength Int?
+  npmPackageLockSha256 String?
   createdAt       DateTime                @default(now())
   proposedFix     ProposedFix             @relation(fields: [proposedFixId], references: [id], onDelete: Restrict)
 

@@ -2,7 +2,8 @@ import "server-only";
 
 import type { ProposedFix } from "@/lib/openai/proposed-fix";
 import { isDraftPrValidationEligible } from "@/lib/github/draft-pull-request-policy";
-import { parseSignedWorkerResponse, workerResponseBindingFailure } from "@/lib/validation/worker-response";
+import { parseSignedWorkerResponse, readBoundedWorkerResponseText, verifiedWorkerPackageLockArtifact, workerResponseBindingFailure } from "@/lib/validation/worker-response";
+import type { VerifiedNpmPackageLockArtifact } from "@/lib/validation/npm-package-lock-artifact";
 import {
   MAX_WORKER_RESPONSE_BYTES,
   VALIDATION_WORKER_MAX_DURATION_MS,
@@ -47,19 +48,24 @@ type ValidationInput = {
   proposedFix: ProposedFix;
 };
 
+export type ProposedFixValidationExecution = {
+  validation: ProposedFixValidationResult;
+  validatedPackageLockArtifact: VerifiedNpmPackageLockArtifact | null;
+};
+
 /**
  * The web application never executes, downloads, extracts, or patches customer
  * code. Validation is fail-closed unless a separately deployed isolated worker
  * is explicitly configured. The worker must own its restricted GitHub identity;
  * OAuth tokens and any Sentinel application secret are never sent to it.
  */
-export async function validateProposedFixInTemporaryWorkspace(input: ValidationInput): Promise<ProposedFixValidationResult> {
-  if (!isSafeGitCommitSha(input.baseCommitSha)) return withBase(createUnableToValidateResult("The repository base commit could not be safely prepared for validation."), input);
+export async function validateProposedFixInTemporaryWorkspace(input: ValidationInput): Promise<ProposedFixValidationExecution> {
+  if (!isSafeGitCommitSha(input.baseCommitSha)) return execution(withBase(createUnableToValidateResult("The repository base commit could not be safely prepared for validation."), input));
 
   const configResult = getWorkerConfig();
   if (configResult.kind === "invalid") {
     logSafeValidationEvent("config_invalid", { reason: configResult.reason });
-    return withBase(createUnableToValidateResult("Production validation is unavailable until a dedicated isolated validation worker is configured."), input);
+    return execution(withBase(createUnableToValidateResult("Production validation is unavailable until a dedicated isolated validation worker is configured."), input));
   }
 
   const jobId = crypto.randomUUID();
@@ -77,16 +83,25 @@ export async function validateProposedFixInTemporaryWorkspace(input: ValidationI
     const bindingFailure = workerResponseBindingFailure(result, jobId, input.baseCommitSha);
     if (bindingFailure) {
       logSafeValidationEvent("worker_response_rejected", { reason: bindingFailure });
-      return withBase(createUnableToValidateResult("The isolated validation worker returned an invalid result."), input);
+      return execution(withBase(createUnableToValidateResult("The isolated validation worker returned an invalid result."), input));
     }
-    return withBase(normalizeWorkerResult(result), input);
+    const artifact = verifiedWorkerPackageLockArtifact(result, {
+      dependencyName: input.proposedFix.packageJsonChange.dependency,
+      dependencyType: input.dependencyType,
+      targetVersion: input.proposedFix.packageJsonChange.to,
+    });
+    if (artifact.kind === "invalid") throw new ValidationWorkerError("result_artifact_invalid", { field: artifact.reason });
+    return execution(
+      withBase(normalizeWorkerResult(result), input),
+      artifact.kind === "valid" ? artifact.artifact : null,
+    );
   } catch (error) {
     const reason = error instanceof ValidationWorkerError ? error.reason : "request_failed";
     logSafeValidationEvent("worker_request_failed", {
       reason,
       ...(error instanceof ValidationWorkerError ? error.diagnostics : {}),
     });
-    return withBase(createUnableToValidateResult("The isolated validation worker could not complete this validation."), input);
+    return execution(withBase(createUnableToValidateResult("The isolated validation worker could not complete this validation."), input));
   }
 }
 
@@ -148,8 +163,9 @@ async function invokeValidationWorker(config: WorkerConfig, request: ValidationW
       throw new ValidationWorkerError("worker_http_error", workerHttpErrorDiagnostics(response.status, config.endpoint));
     }
     if (Number.isFinite(declaredLength) && declaredLength > MAX_WORKER_RESPONSE_BYTES) throw new ValidationWorkerError("response_too_large");
-    const responseBody = await response.text();
-    if (Buffer.byteLength(responseBody) > MAX_WORKER_RESPONSE_BYTES) throw new ValidationWorkerError("oversized_response");
+    const boundedResponse = await readBoundedWorkerResponseText(response, MAX_WORKER_RESPONSE_BYTES);
+    if (boundedResponse.kind === "oversized") throw new ValidationWorkerError("oversized_response");
+    const responseBody = boundedResponse.text;
     const parsed = parseSignedWorkerResponse(config.sharedSecret, responseBody, response.headers.get("x-sentinel-worker-signature"));
     if (parsed.kind === "invalid") throw new ValidationWorkerError(parsed.reason, parsed.diagnostics);
     return parsed.result;
@@ -173,6 +189,10 @@ function normalizeWorkerResult(result: ValidationWorkerResult): ProposedFixValid
 
 function withBase(result: ProposedFixValidationResult, input: Pick<ValidationInput, "defaultBranch" | "baseCommitSha">): ProposedFixValidationResult {
   return { ...result, baseBranch: input.defaultBranch, baseCommitSha: input.baseCommitSha };
+}
+
+function execution(validation: ProposedFixValidationResult, validatedPackageLockArtifact: VerifiedNpmPackageLockArtifact | null = null): ProposedFixValidationExecution {
+  return { validation, validatedPackageLockArtifact };
 }
 
 function isSafeGitCommitSha(value: string) { return /^[a-f\d]{40,64}$/i.test(value); }

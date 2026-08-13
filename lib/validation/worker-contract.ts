@@ -1,7 +1,8 @@
 import type { ProposedFix } from "@/lib/openai/proposed-fix";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { getNpmPackageLockArtifactShapeFailure, type NpmPackageLockArtifactTransport } from "./npm-package-lock-artifact.ts";
 
-export const MAX_WORKER_RESPONSE_BYTES = 64 * 1_024;
+export const MAX_WORKER_RESPONSE_BYTES = 3 * 1_024 * 1_024;
 export const VALIDATION_WORKER_MAX_DURATION_MS = 5 * 60 * 1_000;
 export const MAX_WORKER_TEXT_LENGTH = 1_000;
 const CHECK_NAMES = ["typecheck", "lint", "test", "build"] as const;
@@ -25,9 +26,9 @@ export const VALIDATION_WORKER_POLICY = {
 } as const;
 
 export type ValidationWorkerRequest = { version: 1; jobId: string; repository: { owner: string; name: string; commitSha: string }; dependencyType: "dependency" | "devDependency" | "peerDependency" | "optionalDependency"; proposedFix: ProposedFix; policy: typeof VALIDATION_WORKER_POLICY };
-export type ValidationWorkerResult = { version: 1; jobId: string; repository: { commitSha: string }; overallStatus: (typeof OVERALL_STATUSES)[number]; install: { status: "passed" | "failed" | "skipped"; summary: string }; checks: Array<{ name: (typeof CHECK_NAMES)[number]; status: (typeof CHECK_STATUSES)[number]; durationMs: number; summary: string }>; warnings: string[]; partialReasons: Array<(typeof PARTIAL_REASONS)[number]> };
+export type ValidationWorkerResult = { version: 1; jobId: string; repository: { commitSha: string }; overallStatus: (typeof OVERALL_STATUSES)[number]; install: { status: "passed" | "failed" | "skipped"; summary: string }; checks: Array<{ name: (typeof CHECK_NAMES)[number]; status: (typeof CHECK_STATUSES)[number]; durationMs: number; summary: string }>; warnings: string[]; partialReasons: Array<(typeof PARTIAL_REASONS)[number]>; artifact?: NpmPackageLockArtifactTransport };
 export type WorkerResultValidationFailure = {
-  category: "result_schema_invalid" | "result_status_invalid" | "result_install_invalid" | "result_check_invalid";
+  category: "result_schema_invalid" | "result_status_invalid" | "result_install_invalid" | "result_check_invalid" | "result_artifact_invalid";
   field: string;
 };
 
@@ -91,6 +92,10 @@ export function workerResultValidationFailure(value: unknown): WorkerResultValid
   if (!CHECK_NAMES.every((name) => names.has(name))) return { category: "result_check_invalid", field: "checks.name" };
   if (!Array.isArray(value.warnings) || value.warnings.length > 12 || !value.warnings.every(isSafeText)) return { category: "result_schema_invalid", field: "warnings" };
   if (!Array.isArray(value.partialReasons) || value.partialReasons.length > PARTIAL_REASONS.length || !value.partialReasons.every((reason) => isOneOf(reason, PARTIAL_REASONS))) return { category: "result_schema_invalid", field: "partialReasons" };
+  if (value.artifact !== undefined) {
+    const artifactFailure = getNpmPackageLockArtifactShapeFailure(value.artifact);
+    if (artifactFailure) return { category: "result_artifact_invalid", field: artifactFailure };
+  }
   return null;
 }
 

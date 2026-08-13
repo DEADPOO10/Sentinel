@@ -23,7 +23,7 @@ The worker needs its **own** narrowly scoped GitHub App installation identity, r
 
 ## HTTP provider contract
 
-The provider-neutral app adapter uses `POST /v1/validations`. It signs the exact JSON body with HMAC-SHA256 (`base64url`) in `x-sentinel-request-signature`, along with `x-sentinel-request-timestamp`. The worker must reject stale timestamps and invalid signatures. It returns the `ValidationWorkerResult` shape and signs the exact response body in `x-sentinel-worker-signature`. Sentinel verifies that signature, job ID, commit SHA, bounded response size, and every status field before it persists or issues a validation ticket.
+The provider-neutral app adapter uses `POST /v1/validations`. It signs the exact JSON body with HMAC-SHA256 (`base64url`) in `x-sentinel-request-signature`, along with `x-sentinel-request-timestamp`. The worker must reject stale timestamps and invalid signatures. It returns the `ValidationWorkerResult` shape and signs the exact response body in `x-sentinel-worker-signature`. Sentinel verifies that signature first, followed by the result schema, optional artifact, job ID, commit SHA, and bounded response size before it persists or issues a validation ticket.
 
 The endpoint must be HTTPS and exactly `/v1/validations`. A provider can queue internally but must return the finished structured result within the configured request lifetime; Sentinel intentionally has no validation-job database table yet. The Sentinel HTTP caller and the repository page Server Action are configured for the same five-minute worker budget. The deployed Vercel plan must support a 300-second Node.js function duration. If a long-running asynchronous design is needed, stop and add durable job persistence first rather than pretending a serverless request is reliable.
 
@@ -33,9 +33,30 @@ The Modal worker verifies the raw HMAC-signed request before parsing it, rejects
 
 For each accepted job it downloads a bounded GitHub archive in the outer worker, rejects unsafe ZIP entries (including symlinks, traversal, absolute paths, encrypted entries, multiple roots, and size-limit violations), then passes only the checked archive and signed job data to a fresh Sandbox. The Sandbox receives no Modal Secret and no GitHub credential. It uses the `sentinel` UID (10001), has no mounts, no privileged mode, a five-minute lifetime, a hard 1 vCPU / 2 GiB cap, and a new writable `/work` directory that is terminated at the end of every request.
 
-The Sandbox begins with TLS-only access to `registry.npmjs.org` and `registry.yarnpkg.com`; installs use `--ignore-scripts`; then the worker removes all egress before it executes the fixed `typecheck`, `lint`, `test`, and `build` npm/pnpm/yarn argv allowlist. It never uses a shell to run repository commands. Command output is capped at 24 KiB and response output at 64 KiB.
+The Sandbox begins with TLS-only access to `registry.npmjs.org` and `registry.yarnpkg.com`; installs use `--ignore-scripts`; then the worker removes all egress before it executes the fixed `typecheck`, `lint`, `test`, and `build` npm/pnpm/yarn argv allowlist. It never uses a shell to run repository commands. Command output is capped at 24 KiB. The signed response is capped at 3 MiB so it can carry at most one bounded npm lockfile artifact.
 
-Modal's egress transition uses its current experimental Sandbox API. Do not deploy with a Modal client that lacks `Sandbox._experimental_set_outbound_network_policy`: that would leave checks with package-registry egress, which violates Sentinel policy. The authenticated CLI currently installed on this machine is `1.2.6` and does not expose that API, so this change deliberately does not deploy or even create a remote test app.
+### Authenticated npm lockfile artifact
+
+The only generated artifact in contract version 1 is the root `package-lock.json`. The optional result field has the exact shape:
+
+```json
+{
+  "kind": "npm_package_lock",
+  "path": "package-lock.json",
+  "encoding": "base64",
+  "content": "<bounded exact bytes>",
+  "byteLength": 123,
+  "sha256": "<64 lowercase hexadecimal characters>"
+}
+```
+
+The raw artifact limit is exactly 2 MiB (2,097,152 bytes); it is rejected rather than truncated. The worker emits it only after the original root npm lockfile was verified, the exact authorized `package.json` value was changed, `npm install --package-lock-only --ignore-scripts --no-audit --no-fund` succeeded, the synchronized root lock metadata contains the target dependency range, and `npm ci --ignore-scripts --no-audit --no-fund` succeeded. It must be a non-empty regular file at exactly `/work/repo/package-lock.json`, valid UTF-8 JSON, and lockfile version 2 or 3.
+
+Sentinel verifies the HMAC over the complete response before decoding the artifact. It then enforces the encoded and decoded limits, canonical base64, exact byte length, recomputed SHA-256, strict UTF-8, JSON structure, lockfile version, root package metadata, and the dependency section/target range. The exact verified bytes are persisted only on the corresponding `ValidationRun`; artifact contents are not sent to the browser or placed in a workflow ticket. The ticket contains only the validation-run ID, while the database relationship binds that run to the proposed fix and immutable base commit.
+
+No arbitrary artifact path, source file, archive, public download URL, or Cloudflare storage is supported. `npm-shrinkwrap.json`, pnpm, Yarn, and Bun lockfiles remain fail-closed for Draft PR creation.
+
+Modal's egress transition uses its current experimental Sandbox API. Do not deploy with a Modal client that lacks `Sandbox._experimental_set_outbound_network_policy`: that would leave checks with package-registry egress, which violates Sentinel policy. The worker tests and authenticated development profile currently target Modal SDK 1.5.x.
 
 Modal does not presently expose a `readOnlyRootFilesystem` Sandbox parameter. The image runs the repository process as the unprivileged `sentinel` user and confines all worker writes to `/work`; this is the closest enforceable Modal configuration. Treat a platform-level read-only-root guarantee as a production-audit gate, not as a claim this implementation makes.
 
@@ -79,3 +100,5 @@ SENTINEL_VALIDATION_WORKER_SHARED_SECRET=<new random value, at least 32 characte
 ```
 
 Do not add these values to `.env` or `.env.local` in this repository. Keep `SENTINEL_PR_CREATION_ENABLED` unset or `false`: validation does not enable draft PR creation. Draft PRs remain human-triggered and are never auto-merged.
+
+For this artifact contract, deploy in this order: apply the backward-compatible database migration, deploy the Vercel consumer/persistence changes, then deploy the Modal artifact producer. This lets the new application accept an artifact-absent response from the old worker during rollout and avoids sending a large new result to an old parser. Cloudflare remains a transparent credential-free proxy and does not require a code deployment. Keep Draft PR creation disabled throughout rollout; enable it only later for one separately approved controlled test.

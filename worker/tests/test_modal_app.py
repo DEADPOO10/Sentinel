@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import tempfile
 import time
@@ -10,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from worker.core import CHECK_NAMES, MAX_COMMAND_OUTPUT_BYTES, POLICY, ValidationError, canonical_json, sign, verify_signature
-from worker.modal_app import CHECK_TIMEOUT_SECONDS, CLEANUP_RESERVE_SECONDS, MAX_RESULT_SUMMARY_CHARS, SANDBOX_AGENT_REMOTE_PATH, SANDBOX_USER_PREFIX, TOTAL_VALIDATION_DURATION_SECONDS, TRUNCATED_OUTPUT_NOTICE, VALIDATION_EXECUTION_BUDGET_SECONDS, cleanup_sandbox, command_summary, command_timeout_seconds, create_api, execute_job, install_argv, normalize_command_output, npm_lockfile_sync_argv, read_bounded_output, run_validation_checks, trusted_sandbox_agent_path
+from worker.modal_app import CHECK_TIMEOUT_SECONDS, CLEANUP_RESERVE_SECONDS, MAX_NPM_PACKAGE_LOCK_ARTIFACT_BYTES, MAX_RESULT_SUMMARY_CHARS, SANDBOX_AGENT_REMOTE_PATH, SANDBOX_USER_PREFIX, TOTAL_VALIDATION_DURATION_SECONDS, TRUNCATED_OUTPUT_NOTICE, VALIDATION_EXECUTION_BUDGET_SECONDS, cleanup_sandbox, command_summary, command_timeout_seconds, create_api, create_npm_package_lock_artifact, execute_job, install_argv, normalize_command_output, npm_lockfile_sync_argv, read_bounded_output, run_validation_checks, trusted_sandbox_agent_path
 
 
 def valid_job():
@@ -66,6 +67,16 @@ class TimedOutProcess(FakeProcess):
         self.wait = AioOnlyCall(side_effect=TimeoutError())
 
 
+class FakeFileInfo:
+    def __init__(self, path, size, *, regular=True):
+        self.path = path
+        self.size = size
+        self._regular = regular
+
+    def is_file(self):
+        return self._regular
+
+
 class FakeSandbox:
     def __init__(
         self,
@@ -90,20 +101,23 @@ class FakeSandbox:
             "version": "1.0.0",
             "lockfileVersion": 3,
             "packages": {
-                "": {"name": lockfile_root_name, "version": "1.0.0"},
+                "": {"name": lockfile_root_name, "version": "1.0.0", "dependencies": {"example": "1.1.0"}},
                 "node_modules/example": {"version": lockfile_dependency_version},
             },
         }
+        lockfile_bytes = json.dumps(lockfile).encode("utf-8")
         self.filesystem = SimpleNamespace(
             write_bytes=AioOnlyCall(side_effect=[archive_upload_error, job_upload_error]),
             copy_from_local=AioOnlyCall(side_effect=agent_upload_error),
-            list_files=AioOnlyCall(return_value=[SimpleNamespace(path="/work/repo/package-lock.json")]),
+            list_files=AioOnlyCall(return_value=[FakeFileInfo("/work/repo/package-lock.json", len(lockfile_bytes))]),
+            read_bytes=AioOnlyCall(return_value=lockfile_bytes),
             read_text=AioOnlyCall(
                 side_effect=[
                     json.dumps(package),
                     json.dumps(lockfile),
                     json.dumps(package),
                     json.dumps(lockfile),
+                    json.dumps(package),
                     *[json.dumps(package) for _ in CHECK_NAMES],
                 ]
             ),
@@ -257,6 +271,12 @@ class ModalAsyncExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["overallStatus"], "passed")
         self.assertIn("package_lock_synchronized_in_sandbox", result["warnings"])
+        self.assertEqual(result["artifact"]["path"], "package-lock.json")
+        self.assertEqual(result["artifact"]["byteLength"], len(sandbox.filesystem.read_bytes.aio.return_value))
+        self.assertEqual(
+            __import__("base64").b64decode(result["artifact"]["content"]),
+            sandbox.filesystem.read_bytes.aio.return_value,
+        )
         self.assertIn("regenerated only inside the isolated validation sandbox", result["install"]["summary"])
         self.assertEqual(result["repository"]["commitSha"], "a" * 40)
         self.assertEqual(sandbox.filesystem.write_bytes.aio.await_count, 2)
@@ -271,7 +291,8 @@ class ModalAsyncExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(install_argv("npm"), ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"])
         for call in sandbox.exec.aio.await_args_list:
             self.assertEqual(call.args[: len(SANDBOX_USER_PREFIX)], SANDBOX_USER_PREFIX)
-        sandbox.filesystem.list_files.aio.assert_awaited_once_with("/work/repo")
+        self.assertEqual(sandbox.filesystem.list_files.aio.await_count, 2)
+        self.assertTrue(all(call.args == ("/work/repo",) for call in sandbox.filesystem.list_files.aio.await_args_list))
         sandbox._experimental_set_outbound_network_policy.aio.assert_awaited_once_with(
             outbound_domain_allowlist=[], outbound_cidr_allowlist=[]
         )
@@ -306,6 +327,7 @@ class ModalAsyncExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["overallStatus"], "failed")
         self.assertEqual(result["warnings"], ["lockfile_update_failed"])
+        self.assertNotIn("artifact", result)
         self.assertEqual(sandbox.exec.aio.await_count, 2)
         sandbox._experimental_set_outbound_network_policy.aio.assert_not_awaited()
         sandbox.terminate.aio.assert_awaited_once_with(wait=True)
@@ -322,8 +344,97 @@ class ModalAsyncExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["overallStatus"], "failed")
         self.assertEqual(result["warnings"], ["dependency_install_failed"])
+        self.assertNotIn("artifact", result)
         self.assertEqual(sandbox.exec.aio.await_count, 3)
         sandbox._experimental_set_outbound_network_policy.aio.assert_not_awaited()
+
+    async def test_non_regular_lockfile_is_not_returned_but_validation_continues(self):
+        sandbox = FakeSandbox()
+        sandbox.filesystem.list_files = AioOnlyCall(
+            side_effect=[
+                [FakeFileInfo("/work/repo/package-lock.json", 100)],
+                [FakeFileInfo("/work/repo/package-lock.json", 100, regular=False)],
+            ]
+        )
+        with patch("worker.modal_app.fetch_verified_archive", return_value=b"checked archive"), patch(
+            "worker.modal_app.inspect_github_zip"
+        ), patch("worker.modal_app.create_sandbox", new=AsyncMock(return_value=sandbox)), patch(
+            "worker.modal_app.trusted_sandbox_agent_path", return_value=Path("/opt/sentinel/worker/sandbox_agent.py")
+        ), self.assertLogs("sentinel.validation_worker", level="WARNING") as logs:
+            result = await execute_job(valid_job())
+
+        self.assertEqual(result["overallStatus"], "passed")
+        self.assertNotIn("artifact", result)
+        self.assertIn("validated_lockfile_artifact_unavailable", result["warnings"])
+        self.assertIn("reason=artifact_not_regular_file", logs.output[0])
+
+    async def test_non_npm_repository_never_returns_a_package_lock_artifact(self):
+        sandbox = FakeSandbox()
+        package = {
+            "name": "example",
+            "version": "1.0.0",
+            "dependencies": {"example": "1.1.0"},
+            "scripts": {name: "node -e \"process.exit(0)\"" for name in CHECK_NAMES},
+        }
+        sandbox.filesystem.list_files = AioOnlyCall(return_value=[FakeFileInfo("/work/repo/yarn.lock", 100)])
+        sandbox.filesystem.read_text = AioOnlyCall(return_value=json.dumps(package))
+        sandbox.exec = AioOnlyCall(side_effect=[
+            FakeProcess(output="prepared"),
+            FakeProcess(output="installed"),
+            *[FakeProcess(output=name) for name in CHECK_NAMES],
+        ])
+        with patch("worker.modal_app.fetch_verified_archive", return_value=b"checked archive"), patch(
+            "worker.modal_app.inspect_github_zip"
+        ), patch("worker.modal_app.create_sandbox", new=AsyncMock(return_value=sandbox)), patch(
+            "worker.modal_app.trusted_sandbox_agent_path", return_value=Path("/opt/sentinel/worker/sandbox_agent.py")
+        ):
+            result = await execute_job(valid_job())
+
+        self.assertEqual(result["overallStatus"], "passed")
+        self.assertNotIn("artifact", result)
+        self.assertEqual(sandbox.filesystem.read_bytes.aio.await_count, 0)
+
+    async def test_unsafe_post_sync_edit_verification_never_reaches_artifact_collection(self):
+        sandbox = FakeSandbox()
+        binding_checks = AsyncMock(side_effect=[None, ValidationError("lockfile_update_failed")])
+        artifact_collection = AsyncMock()
+        with patch("worker.modal_app.fetch_verified_archive", return_value=b"checked archive"), patch(
+            "worker.modal_app.inspect_github_zip"
+        ), patch("worker.modal_app.create_sandbox", new=AsyncMock(return_value=sandbox)), patch(
+            "worker.modal_app.trusted_sandbox_agent_path", return_value=Path("/opt/sentinel/worker/sandbox_agent.py")
+        ), patch("worker.modal_app.verify_npm_lockfile_binding", new=binding_checks), patch(
+            "worker.modal_app.collect_npm_package_lock_artifact", new=artifact_collection
+        ):
+            with self.assertRaisesRegex(ValidationError, "lockfile_update_failed"):
+                await execute_job(valid_job())
+
+        artifact_collection.assert_not_awaited()
+        sandbox.terminate.aio.assert_awaited_once_with(wait=True)
+        sandbox.detach.aio.assert_awaited_once()
+
+    def test_artifact_contains_exact_bounded_bytes_and_sha256(self):
+        package = json.dumps({"name": "example", "version": "1.0.0", "dependencies": {"example": "1.1.0"}})
+        raw = json.dumps({
+            "name": "example",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {"": {"name": "example", "version": "1.0.0", "dependencies": {"example": "1.1.0"}}},
+        }, separators=(",", ":")).encode("utf-8")
+
+        artifact = create_npm_package_lock_artifact(raw, package, valid_job())
+
+        self.assertEqual(artifact["kind"], "npm_package_lock")
+        self.assertEqual(artifact["path"], "package-lock.json")
+        self.assertEqual(artifact["byteLength"], len(raw))
+        self.assertEqual(artifact["sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(__import__("base64").b64decode(artifact["content"]), raw)
+
+    def test_empty_and_oversized_artifacts_are_rejected_without_truncation(self):
+        package = json.dumps({"name": "example", "version": "1.0.0", "dependencies": {"example": "1.1.0"}})
+        with self.assertRaisesRegex(ValidationError, "artifact_empty"):
+            create_npm_package_lock_artifact(b"", package, valid_job())
+        with self.assertRaisesRegex(ValidationError, "artifact_oversized"):
+            create_npm_package_lock_artifact(b"x" * (MAX_NPM_PACKAGE_LOCK_ARTIFACT_BYTES + 1), package, valid_job())
 
     async def test_egress_is_locked_only_after_resolution_and_before_repository_scripts(self):
         sandbox = FakeSandbox()

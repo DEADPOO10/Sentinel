@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -17,7 +19,7 @@ from typing import Any
 import modal
 from fastapi import Request
 
-from worker.core import CHECK_NAMES, MAX_ARCHIVE_COMPRESSED_BYTES, MAX_COMMAND_OUTPUT_BYTES, MAX_REQUEST_BYTES, POLICY, ValidationError, canonical_json, inspect_github_zip, parse_and_validate_job, request_auth_failure_reason, result_for_error, sign
+from worker.core import CHECK_NAMES, MAX_ARCHIVE_COMPRESSED_BYTES, MAX_COMMAND_OUTPUT_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, POLICY, ValidationError, canonical_json, inspect_github_zip, parse_and_validate_job, request_auth_failure_reason, result_for_error, sign
 
 APP_NAME = "sentinel-validation-worker"
 SECRET_NAME = "sentinel-validation-worker"
@@ -76,6 +78,8 @@ SANDBOX_COMMAND_ENV = {
 }
 MAX_SAFE_SDK_REASON_CHARS = 240
 MAX_RESULT_SUMMARY_CHARS = 1_000
+MAX_NPM_PACKAGE_LOCK_ARTIFACT_BYTES = 2 * 1024 * 1024
+NPM_PACKAGE_LOCK_PATH = "/work/repo/package-lock.json"
 TRUNCATED_OUTPUT_NOTICE = "Command output was truncated at the 24 KiB diagnostic limit."
 # Keep a small beginning for command identity and a larger ending for the
 # failure summary most test runners print last. Together with the marker these
@@ -163,6 +167,8 @@ async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
     await asyncio.to_thread(inspect_github_zip, archive)
     sandbox = None
     result: dict[str, Any] | None = None
+    artifact: dict[str, Any] | None = None
+    artifact_unavailable = False
     try:
         sandbox = await create_sandbox(job)
         await upload_sandbox_inputs(sandbox, archive, job)
@@ -189,7 +195,7 @@ async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
                 # `npm install --package-lock-only` must not be allowed to
                 # alter the authorized package.json edit while it resolves the
                 # transitive graph. Recheck the exact server-authorized value.
-                await verify_npm_lockfile_binding(sandbox, job)
+                await verify_npm_lockfile_binding(sandbox, job, require_synchronized_dependency=True)
                 lockfile_synchronized = True
         if result is None:
             install_timeout = command_timeout_seconds(validation_deadline, SETUP_COMMAND_TIMEOUT_SECONDS)
@@ -200,10 +206,18 @@ async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
             if result is None and install["status"] != "passed":
                 result = completed_result(job, "failed", {"status": "failed", "summary": install["summary"]}, skipped_checks("Not run because dependency installation failed."), ["dependency_install_failed"], [])
             elif result is None:
+                if lockfile_synchronized:
+                    try:
+                        artifact = await collect_npm_package_lock_artifact(sandbox, job)
+                    except ValidationError as error:
+                        artifact_unavailable = True
+                        log_lockfile_artifact_failure(error.args[0] if error.args else "artifact_invalid")
                 await disable_sandbox_egress(sandbox)
                 checks, timed_out, deadline_reached, failed, missing_script = await run_validation_checks(sandbox, manager, validation_deadline)
                 skipped = any(check["status"] == "skipped" for check in checks)
                 warnings = ["package_lock_synchronized_in_sandbox"] if lockfile_synchronized else []
+                if artifact_unavailable:
+                    warnings.append("validated_lockfile_artifact_unavailable")
                 partial_reasons: list[str] = []
                 if failed:
                     warnings.append("validation_check_failed")
@@ -220,7 +234,7 @@ async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
                     if missing_script:
                         warnings.append("one_or_more_allowlisted_checks_not_defined")
                     partial_reasons.append("skipped_checks")
-                result = completed_result(job, overall, {"status": "passed", "summary": install_summary(lockfile_synchronized)}, checks, warnings, partial_reasons)
+                result = completed_result(job, overall, {"status": "passed", "summary": install_summary(lockfile_synchronized)}, checks, warnings, partial_reasons, artifact=artifact)
     finally:
         if sandbox is not None:
             cleanup_succeeded = await cleanup_sandbox(sandbox)
@@ -383,7 +397,7 @@ async def determine_package_manager(sandbox) -> str:
     raise ValidationError("no_lockfile")
 
 
-async def verify_npm_lockfile_binding(sandbox, job: dict[str, Any]) -> None:
+async def verify_npm_lockfile_binding(sandbox, job: dict[str, Any], *, require_synchronized_dependency: bool = False) -> None:
     """Accept only an npm lockfile that identifies the validated root package."""
     try:
         package = json.loads(await sandbox.filesystem.read_text.aio("/work/repo/package.json"))
@@ -399,6 +413,7 @@ async def verify_npm_lockfile_binding(sandbox, job: dict[str, Any]) -> None:
         "optionalDependency": "optionalDependencies",
     }[job["dependencyType"]]
     dependencies = package.get(section) if isinstance(package, dict) else None
+    lock_dependencies = root.get(section) if isinstance(root, dict) else None
     if (
         not isinstance(package, dict)
         or not isinstance(root, dict)
@@ -406,8 +421,78 @@ async def verify_npm_lockfile_binding(sandbox, job: dict[str, Any]) -> None:
         or package.get("version") != root.get("version")
         or not isinstance(dependencies, dict)
         or dependencies.get(change["dependency"]) != change["to"]
+        or (require_synchronized_dependency and (not isinstance(lock_dependencies, dict) or lock_dependencies.get(change["dependency"]) != change["to"]))
     ):
         raise ValidationError("lockfile_update_failed")
+
+
+async def collect_npm_package_lock_artifact(sandbox, job: dict[str, Any]) -> dict[str, Any]:
+    """Read exactly one bounded regular root package-lock after install succeeds."""
+    try:
+        entries = await sandbox.filesystem.list_files.aio("/work/repo")
+        matches = [entry for entry in entries if getattr(entry, "path", None) == NPM_PACKAGE_LOCK_PATH]
+        if len(matches) != 1 or not matches[0].is_file():
+            raise ValidationError("artifact_not_regular_file")
+        declared_size = getattr(matches[0], "size", None)
+        if not isinstance(declared_size, int) or isinstance(declared_size, bool) or declared_size <= 0:
+            raise ValidationError("artifact_empty")
+        if declared_size > MAX_NPM_PACKAGE_LOCK_ARTIFACT_BYTES:
+            raise ValidationError("artifact_oversized")
+        raw = await sandbox.filesystem.read_bytes.aio(NPM_PACKAGE_LOCK_PATH)
+        package_text = await sandbox.filesystem.read_text.aio("/work/repo/package.json")
+    except ValidationError:
+        raise
+    except Exception as error:
+        raise ValidationError("artifact_read_failed") from error
+    if len(raw) != declared_size:
+        raise ValidationError("artifact_size_mismatch")
+    return create_npm_package_lock_artifact(raw, package_text, job)
+
+
+def create_npm_package_lock_artifact(raw: bytes, package_text: str, job: dict[str, Any]) -> dict[str, Any]:
+    if not raw:
+        raise ValidationError("artifact_empty")
+    if len(raw) > MAX_NPM_PACKAGE_LOCK_ARTIFACT_BYTES:
+        raise ValidationError("artifact_oversized")
+    try:
+        content = raw.decode("utf-8", "strict")
+        lockfile = json.loads(content)
+        package = json.loads(package_text)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+        raise ValidationError("artifact_invalid_json") from error
+    version = lockfile.get("lockfileVersion") if isinstance(lockfile, dict) else None
+    packages = lockfile.get("packages") if isinstance(lockfile, dict) else None
+    root = packages.get("") if isinstance(packages, dict) else None
+    change = job["proposedFix"]["packageJsonChange"]
+    section = {
+        "dependency": "dependencies",
+        "devDependency": "devDependencies",
+        "peerDependency": "peerDependencies",
+        "optionalDependency": "optionalDependencies",
+    }[job["dependencyType"]]
+    package_dependencies = package.get(section) if isinstance(package, dict) else None
+    lock_dependencies = root.get(section) if isinstance(root, dict) else None
+    if version not in {2, 3} or isinstance(version, bool):
+        raise ValidationError("artifact_unsupported_lockfile_version")
+    if (
+        not isinstance(package, dict)
+        or not isinstance(root, dict)
+        or package.get("name") != root.get("name")
+        or package.get("version") != root.get("version")
+        or not isinstance(package_dependencies, dict)
+        or package_dependencies.get(change["dependency"]) != change["to"]
+        or not isinstance(lock_dependencies, dict)
+        or lock_dependencies.get(change["dependency"]) != change["to"]
+    ):
+        raise ValidationError("artifact_dependency_mismatch")
+    return {
+        "kind": "npm_package_lock",
+        "path": "package-lock.json",
+        "encoding": "base64",
+        "content": base64.b64encode(raw).decode("ascii"),
+        "byteLength": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
 
 
 def npm_lockfile_root(lockfile: Any) -> dict[str, Any] | None:
@@ -626,13 +711,18 @@ def skipped_checks(summary: str, *, names=CHECK_NAMES) -> list[dict[str, Any]]:
     return [{"name": name, "status": "skipped", "durationMs": 0, "summary": summary} for name in names]
 
 
-def completed_result(job: dict[str, Any], overall: str, install: dict[str, str], checks: list[dict[str, Any]], warnings: list[str], partial: list[str]) -> dict[str, Any]:
-    return {"version": 1, "jobId": job["jobId"], "repository": {"commitSha": job["repository"]["commitSha"]}, "overallStatus": overall, "install": install, "checks": checks, "warnings": warnings[:12], "partialReasons": partial}
+def completed_result(job: dict[str, Any], overall: str, install: dict[str, str], checks: list[dict[str, Any]], warnings: list[str], partial: list[str], *, artifact: dict[str, Any] | None = None) -> dict[str, Any]:
+    result = {"version": 1, "jobId": job["jobId"], "repository": {"commitSha": job["repository"]["commitSha"]}, "overallStatus": overall, "install": install, "checks": checks, "warnings": warnings[:12], "partialReasons": partial}
+    if artifact is not None:
+        result["artifact"] = artifact
+    return result
 
 
 def signed_json(secret: str, payload: dict[str, Any], status: int):
     from fastapi.responses import Response
     body = canonical_json(payload)
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise ValidationError("worker_response_too_large")
     return Response(content=body, status_code=status, media_type="application/json", headers={"x-sentinel-worker-signature": sign(secret, body), "cache-control": "no-store"})
 
 
@@ -651,6 +741,23 @@ def log_sandbox_failure(stage: str) -> None:
     if stage not in SAFE_SANDBOX_FAILURE_STAGES:
         stage = "sandbox_result_invalid"
     logger.warning("[sentinel:validation-worker] %s", stage)
+
+
+def log_lockfile_artifact_failure(reason: str) -> None:
+    allowed = {
+        "artifact_not_regular_file",
+        "artifact_empty",
+        "artifact_oversized",
+        "artifact_read_failed",
+        "artifact_size_mismatch",
+        "artifact_invalid_json",
+        "artifact_unsupported_lockfile_version",
+        "artifact_dependency_mismatch",
+    }
+    logger.warning(
+        "[sentinel:validation-worker] lockfile_artifact_unavailable reason=%s",
+        reason if reason in allowed else "artifact_invalid",
+    )
 
 
 def trusted_sandbox_agent_path() -> Path:

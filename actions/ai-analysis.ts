@@ -4,7 +4,7 @@ import { requireUser } from "@/lib/auth/session";
 import { persistImpactAnalysisForFinding } from "@/lib/db/impact-analyses";
 import { persistPullRequestForProposedFix } from "@/lib/db/pull-requests";
 import { persistProposedFixForFinding } from "@/lib/db/proposed-fixes";
-import { persistValidationRun } from "@/lib/db/validation-runs";
+import { getValidatedPackageLockArtifactForDraftPr, persistValidationRun } from "@/lib/db/validation-runs";
 import { getRepositoryDependencyUsage, type RepositoryUsageContext } from "@/lib/github/dependency-usage";
 import { createDraftPullRequestFromVerifiedChanges, getGitHubRepositoryBaseForCurrentUser, type DraftPullRequestActionResult as GitHubDraftPullRequestActionResult } from "@/lib/github/draft-pull-request";
 import { createDraftPrRequestCoordinator, getAuthorizedDraftPrChangeFailure, isDraftPullRequestCreationEnabled, type DraftPrPublicErrorCategory } from "@/lib/github/draft-pull-request-policy";
@@ -298,7 +298,7 @@ async function requestProposedFixValidationForCurrentUser(input: ProposedFixVali
     return validationActionResult(createUnableToValidateResult("Sentinel could not verify the proposed changes against the current repository context."));
   }
 
-  const validation = await validateProposedFixInTemporaryWorkspace({
+  const validationExecution = await validateProposedFixInTemporaryWorkspace({
     owner: repositoryBase.repository.owner,
     repository: repositoryBase.repository.repository,
     defaultBranch: repositoryBase.repository.defaultBranch,
@@ -306,7 +306,8 @@ async function requestProposedFixValidationForCurrentUser(input: ProposedFixVali
     dependencyType: dependency.type,
     proposedFix,
   });
-  await persistValidationRun({
+  const validation = validationExecution.validation;
+  const persistedValidation = await persistValidationRun({
     githubRepositoryId: packageJsonResult.repository.githubRepositoryId,
     baseCommitSha: repositoryBase.repository.baseCommitSha,
     dependency: {
@@ -318,10 +319,15 @@ async function requestProposedFixValidationForCurrentUser(input: ProposedFixVali
     proposal: proposedFix,
     validation,
     validationAttemptId: input.validationAttemptId,
+    validatedPackageLockArtifact: validationExecution.validatedPackageLockArtifact,
   });
   if (!isProposedFixValidationEligibleForDraftPullRequest(validation)
     || !isPullRequestCreationEnabled()
     || getAuthorizedDraftPrChangeFailure(proposedFix, []) !== null) return validationActionResult(validation);
+  if (persistedValidation.kind === "unavailable") {
+    logSafeProposedFixActionEvent("validation_ticket_unavailable", { category: "validation_persistence_unavailable" });
+    return validationActionResult(validation);
+  }
   if (validation.baseBranch !== repositoryBase.repository.defaultBranch || validation.baseCommitSha !== repositoryBase.repository.baseCommitSha) {
     logSafeProposedFixActionEvent("validation_ticket_unavailable", { category: "validation_base_binding_mismatch" });
     return validationActionResult(validation);
@@ -335,6 +341,7 @@ async function requestProposedFixValidationForCurrentUser(input: ProposedFixVali
     dependencyType: dependency.type,
     defaultBranch: repositoryBase.repository.defaultBranch,
     baseCommitSha: repositoryBase.repository.baseCommitSha,
+    validationRunId: persistedValidation.validationRunId,
     analysis: impactAnalysis,
     proposedFix,
     validationResult: getValidationTicketSnapshotInput(validation),
@@ -441,6 +448,22 @@ export async function requestDraftPullRequest(input: unknown): Promise<DraftPull
     return draftPrActionError("repository_changed_since_validation", "The repository changed after validation. Run analysis and validation again before creating a PR.");
   }
 
+  const validatedArtifact = await getValidatedPackageLockArtifactForDraftPr(validationBinding.validationRunId, {
+    githubRepositoryId: packageJsonResult.repository.githubRepositoryId,
+    baseCommitSha: validationBinding.baseCommitSha,
+    dependency: {
+      packageName: dependency.name,
+      dependencyType: dependency.type,
+      declaredVersion: dependency.version,
+      latestVersion: latestDependencyVersion,
+    },
+    proposal: proposedFix,
+  });
+  if (validatedArtifact.kind !== "ready") {
+    logSafePrActionEvent("creation_preflight_failed", { category: "validated_lockfile_unavailable" });
+    return draftPrActionError("validated_lockfile_invalid", "The exact validated lockfile artifact could not be verified. Run validation again before creating a draft PR.");
+  }
+
   const draftPullRequestInput = {
     owner: repositoryBase.repository.owner,
     repository: repositoryBase.repository.repository,
@@ -458,6 +481,7 @@ export async function requestDraftPullRequest(input: unknown): Promise<DraftPull
     validation,
     impactAnalysis,
     proposedChangeIdentifier: validationBinding.proposedChangeIdentifier,
+    validatedPackageLockArtifact: validatedArtifact.artifact,
   };
 
   return draftPullRequestRequests.run(input.validationTicket, async () => {

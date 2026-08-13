@@ -4,7 +4,7 @@ import {
   createDraftPrBranchPayload,
   createDraftPullRequestPayload,
   createSentinelBranchName,
-  getAuthorizedDraftPrChangeFailure,
+  getAuthorizedDraftPrFilePaths,
   getDraftPrCommitMessage,
   isDraftPullRequestCreationEnabled,
   isMatchingSentinelPullRequest,
@@ -17,23 +17,24 @@ import { isValidGitHubRepository } from "@/lib/github/package-json";
 import type { ImpactAnalysisSnapshot } from "@/lib/impact-analysis-ticket";
 import type { ProposedFix } from "@/lib/openai/proposed-fix";
 import type { ProposedFixValidationResult } from "@/lib/validation/proposed-fix-validation";
+import { verifyNpmPackageLockArtifact, type VerifiedNpmPackageLockArtifact } from "@/lib/validation/npm-package-lock-artifact";
 
 const GITHUB_API_ORIGIN = "https://api.github.com/";
 const GITHUB_API_VERSION = "2026-03-10";
 export const DRAFT_PULL_REQUEST_LIMITS = {
   requestTimeoutMs: 15_000,
-  maxFiles: 1,
+  maxFiles: 2,
   maxSourceFileBytes: 128 * 1024,
-  maxCombinedFileBytes: 256 * 1024,
+  maxCombinedFileBytes: (2 * 1024 * 1024) + (128 * 1024),
   maxTreeResponseBytes: 8 * 1024 * 1024,
   maxOpenPullRequestsExamined: 100,
   maxBranchNameLength: 96,
 } as const;
 
 type GitHubHttpCategory = "rate_limited" | "server_error" | "client_error";
-type DraftPullRequestFailureCategory = "github_authorization" | "repository_access" | "write_access" | "repository_restricted" | "stale_base" | "dependency_changed" | "base_commit_unavailable" | "tree_unavailable" | "change_verification" | "prohibited_file" | "lockfile_artifact_required" | "source_changes_not_allowed" | "github_api" | "timeout" | "request_error" | "branch_creation" | "pull_request_creation";
+type DraftPullRequestFailureCategory = "github_authorization" | "repository_access" | "write_access" | "repository_restricted" | "stale_base" | "dependency_changed" | "base_commit_unavailable" | "tree_unavailable" | "change_verification" | "prohibited_file" | "lockfile_artifact_required" | "validated_lockfile_required" | "validated_lockfile_invalid" | "source_changes_not_allowed" | "github_api" | "timeout" | "request_error" | "branch_creation" | "pull_request_creation";
 type TreeEntry = { path: string; mode: "100644" | "100755"; type: "blob"; size: number | null };
-type VerifiedFileChange = { path: string; mode: "100644" | "100755"; content: string };
+type VerifiedFileChange = { path: string; mode: "100644" | "100755"; content: string | Uint8Array };
 
 export type GitHubRepositoryBase = {
   owner: string;
@@ -104,6 +105,7 @@ export type VerifiedDraftPullRequestInput = {
   validation: ProposedFixValidationResult;
   impactAnalysis: ImpactAnalysisSnapshot;
   proposedChangeIdentifier: string;
+  validatedPackageLockArtifact: VerifiedNpmPackageLockArtifact | null;
 };
 
 class DraftPullRequestError extends Error {
@@ -147,15 +149,15 @@ export async function createDraftPullRequestFromVerifiedChanges(input: VerifiedD
     const repositoryBase = await getGitHubRepositoryBase(input.owner, input.repository, accessToken, true);
     if (!matchesValidatedBase(repositoryBase, input)) return staleBaseResult();
 
-    const existingPullRequest = await findExistingDraftPullRequest(input, accessToken);
-    if (existingPullRequest) return existingPullRequest;
-
     const baseCommit = await getBaseCommit(input, accessToken);
     const baseTree = await getBaseTree(input, baseCommit.treeSha, accessToken);
     const verifiedChanges = await reconstructVerifiedChanges(input, baseTree, accessToken);
     if (verifiedChanges.length === 0) {
       throw new DraftPullRequestError("change_verification", "reconstruct_changes");
     }
+
+    const existingPullRequest = await findExistingDraftPullRequest(input, accessToken);
+    if (existingPullRequest) return existingPullRequest;
 
     const treeEntries = await Promise.all(verifiedChanges.map(async (change) => ({
       path: change.path,
@@ -272,10 +274,10 @@ async function getBaseTree(input: VerifiedDraftPullRequestInput, treeSha: string
 }
 
 async function reconstructVerifiedChanges(input: VerifiedDraftPullRequestInput, baseTree: Map<string, TreeEntry>, accessToken: string) {
-  const policyFailure = getAuthorizedDraftPrChangeFailure(input.proposedFix, baseTree.keys());
-  if (policyFailure) {
+  const authorizedFiles = getAuthorizedDraftPrFilePaths(input.proposedFix, baseTree.keys(), input.validatedPackageLockArtifact);
+  if (authorizedFiles.kind === "rejected") {
     throw new DraftPullRequestError(
-      policyFailure === "package_json_change_required" ? "change_verification" : policyFailure,
+      authorizedFiles.category === "package_json_change_required" ? "change_verification" : authorizedFiles.category,
       "authorized_change_policy",
     );
   }
@@ -294,13 +296,14 @@ async function reconstructVerifiedChanges(input: VerifiedDraftPullRequestInput, 
     }
 
     const file = await fetchTextFileAtCommit(input, path, accessToken);
-    combinedBytes += file.byteLength;
-    if (combinedBytes > DRAFT_PULL_REQUEST_LIMITS.maxCombinedFileBytes) {
-      throw new DraftPullRequestError("change_verification", "combined_file_size");
-    }
     const updatedContent = update(file.content);
     if (updatedContent === null || updatedContent === file.content) {
       throw new DraftPullRequestError("change_verification", "exact_change_verification");
+    }
+    const updatedByteLength = Buffer.byteLength(updatedContent, "utf8");
+    combinedBytes += updatedByteLength;
+    if (updatedByteLength > DRAFT_PULL_REQUEST_LIMITS.maxSourceFileBytes || combinedBytes > DRAFT_PULL_REQUEST_LIMITS.maxCombinedFileBytes) {
+      throw new DraftPullRequestError("change_verification", "combined_file_size");
     }
     paths.add(path);
     changes.push({ path, mode: entry.mode, content: updatedContent });
@@ -311,6 +314,37 @@ async function reconstructVerifiedChanges(input: VerifiedDraftPullRequestInput, 
     input.dependency,
     input.proposedFix.packageJsonChange,
   ));
+
+  if (authorizedFiles.paths.length === 2) {
+    const artifact = input.validatedPackageLockArtifact;
+    if (!artifact) throw new DraftPullRequestError("validated_lockfile_required", "artifact_missing");
+    const verified = verifyNpmPackageLockArtifact({
+      kind: artifact.kind,
+      path: artifact.path,
+      encoding: "base64",
+      content: Buffer.from(artifact.bytes).toString("base64"),
+      byteLength: artifact.byteLength,
+      sha256: artifact.sha256,
+    }, {
+      dependencyName: input.dependency.name,
+      dependencyType: input.dependency.dependencyType,
+      targetVersion: input.dependency.latestVersion,
+    });
+    if (verified.kind !== "valid") throw new DraftPullRequestError("validated_lockfile_invalid", "artifact_reverification");
+    const entry = baseTree.get("package-lock.json");
+    if (!entry || entry.type !== "blob" || entry.mode !== "100644") throw new DraftPullRequestError("validated_lockfile_invalid", "artifact_base_file");
+    combinedBytes += verified.artifact.byteLength;
+    if (combinedBytes > DRAFT_PULL_REQUEST_LIMITS.maxCombinedFileBytes || paths.has("package-lock.json") || changes.length >= DRAFT_PULL_REQUEST_LIMITS.maxFiles) {
+      throw new DraftPullRequestError("validated_lockfile_invalid", "artifact_size_or_count");
+    }
+    paths.add("package-lock.json");
+    changes.push({ path: "package-lock.json", mode: "100644", content: verified.artifact.bytes });
+  }
+
+  const actualPaths = changes.map((change) => change.path);
+  if (actualPaths.length !== authorizedFiles.paths.length || actualPaths.some((path, index) => path !== authorizedFiles.paths[index])) {
+    throw new DraftPullRequestError("change_verification", "authorized_file_map");
+  }
 
   return changes;
 }
@@ -326,9 +360,9 @@ async function fetchTextFileAtCommit(input: VerifiedDraftPullRequestInput, path:
   return file;
 }
 
-async function createBlob(input: VerifiedDraftPullRequestInput, content: string, accessToken: string) {
+async function createBlob(input: VerifiedDraftPullRequestInput, content: string | Uint8Array, accessToken: string) {
   const response = await requestGitHub(input.owner, input.repository, accessToken, "POST", `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/blobs`, "create_blob", {
-    content: Buffer.from(content, "utf8").toString("base64"),
+    content: Buffer.from(content).toString("base64"),
     encoding: "base64",
   });
   const sha = parseShaResponse(await readBoundedJson(response, 256 * 1024));
@@ -639,6 +673,8 @@ function getDraftPullRequestErrorResult(error: unknown): DraftPullRequestActionR
     if (error.category === "write_access" || error.category === "repository_restricted") return draftPrError("github_write_permission_required", "GitHub write access could not be verified for this repository.");
     if (error.category === "dependency_changed") return draftPrError("proposed_fix_stale", "This dependency no longer has the expected update. Run analysis and validation again.");
     if (error.category === "lockfile_artifact_required") return draftPrError("lockfile_artifact_required", "Sentinel cannot safely create this draft PR until the validated lockfile artifact is available.");
+    if (error.category === "validated_lockfile_required") return draftPrError("validated_lockfile_required", "This npm repository requires the exact package-lock.json produced by the eligible validation run.");
+    if (error.category === "validated_lockfile_invalid") return draftPrError("validated_lockfile_invalid", "The exact validated package-lock.json artifact could not be verified. Run validation again before creating a draft PR.");
     if (error.category === "source_changes_not_allowed" || error.category === "prohibited_file") return draftPrError("source_changes_not_allowed", "Draft PR V1 allows only the server-verified package.json dependency change.");
     if (error.category === "change_verification") return draftPrError("proposed_fix_stale", "Sentinel could not revalidate the package.json change against the validated repository commit.");
     if (error.category === "branch_creation") return draftPrError("branch_conflict", "GitHub could not create a new Sentinel branch for this draft PR.");

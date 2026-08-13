@@ -76,6 +76,7 @@ type CompletedValidationPrTicketPayload = {
   dependencyType: string;
   defaultBranch: string;
   baseCommitSha: string;
+  validationRunId: string;
   expiresAt: number;
   analysisHash: string;
   proposedFixHash: string;
@@ -109,16 +110,18 @@ export type CompletedValidationPrTicketInput = {
   dependencyType: string;
   defaultBranch: string;
   baseCommitSha: string;
+  validationRunId: string;
   analysis: unknown;
   proposedFix: unknown;
   validationResult: unknown;
 };
 
-export type CompletedValidationPrTicketVerificationInput = Omit<CompletedValidationPrTicketInput, "defaultBranch" | "baseCommitSha">;
+export type CompletedValidationPrTicketVerificationInput = Omit<CompletedValidationPrTicketInput, "defaultBranch" | "baseCommitSha" | "validationRunId">;
 
 export type CompletedValidationPrTicketBinding = {
   defaultBranch: string;
   baseCommitSha: string;
+  validationRunId: string;
   expiresAt: number;
   proposedChangeIdentifier: string;
 };
@@ -223,7 +226,7 @@ export function verifyProposedFixValidationTicket(ticket: string, input: Omit<Pr
 export function createCompletedValidationPrTicket(input: CompletedValidationPrTicketInput) {
   const data = getCompletedValidationTicketData(input);
   const baseCommitSha = normalizeCommitSha(input?.baseCommitSha);
-  if (!data || !isSafeGitRefName(input?.defaultBranch) || !baseCommitSha) return null;
+  if (!data || !isSafeGitRefName(input?.defaultBranch) || !baseCommitSha || !isSafeValidationRunId(input?.validationRunId)) return null;
 
   const secret = getTicketSecret();
   if (!secret) return null;
@@ -238,6 +241,7 @@ export function createCompletedValidationPrTicket(input: CompletedValidationPrTi
     dependencyType: data.dependencyType,
     defaultBranch: input.defaultBranch,
     baseCommitSha,
+    validationRunId: input.validationRunId,
     expiresAt: Date.now() + TICKET_LIFETIME_MS,
     analysisHash: getAnalysisHash(data.analysis),
     proposedFixHash: getCanonicalProposedFixHash(data.proposedFix),
@@ -275,6 +279,7 @@ export function verifyCompletedValidationPrTicket(ticket: string, input: Complet
     return {
       defaultBranch: payload.defaultBranch,
       baseCommitSha: payload.baseCommitSha,
+      validationRunId: payload.validationRunId,
       expiresAt: payload.expiresAt,
       proposedChangeIdentifier: getProposedChangeIdentifierFromValidatedData({
         owner: payload.owner,
@@ -516,6 +521,7 @@ function isCompletedValidationPrTicketPayload(value: unknown): value is Complete
     && isSafeRepositoryIdentity(value)
     && isSafeGitRefName(value.defaultBranch)
     && normalizeCommitSha(value.baseCommitSha) === value.baseCommitSha
+    && isSafeValidationRunId(value.validationRunId)
     && typeof value.expiresAt === "number"
     && Number.isFinite(value.expiresAt)
     && isSafeHash(value.analysisHash)
@@ -552,6 +558,10 @@ function normalizeCommitSha(value: unknown) {
 
 function isSafeHash(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9_-]{43}$/.test(value);
+}
+
+function isSafeValidationRunId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z\d_-]{1,64}$/.test(value);
 }
 
 function hasExactKeys(value: Record<string, unknown>, expectedKeys: string[]) {

@@ -69,7 +69,9 @@ Before enabling validation in production, replace host execution with a dedicate
 
 Draft PR creation remains off unless `SENTINEL_PR_CREATION_ENABLED=true` is deliberately configured. It requires the signed analysis/proposal/completed-validation workflow and accepts only PASSED validation or an explicitly safe PARTIAL result caused by missing optional checks. FAILED, UNABLE_TO_VALIDATE, timed-out, and cleanup-uncertain results are ineligible. Sentinel revalidates repository write access and the exact default-branch commit immediately before creating a branch and again before creating the PR.
 
-V1 constructs one exact `package.json` dependency-range edit from server-revalidated fields. AI-proposed source-file edits are never committed. If the validated repository has a supported root lockfile, creation fails closed until the isolated worker can return that exact authenticated, bounded lockfile artifact; Sentinel does not create a stale package.json-only PR. Eligible no-lockfile repositories use `sentinel/deps/<sanitized-dependency>/<proposal-id>` and always create a GitHub Draft. Sentinel never writes the default branch, marks a PR ready for review, auto-merges, or runs PR creation in the background.
+V1 constructs one exact `package.json` dependency-range edit from server-revalidated fields. AI-proposed source-file edits are never committed. For a root `package-lock.json`, the same isolated validation may return one HMAC-authenticated artifact capped at 2 MiB. Sentinel verifies its base64, byte length, SHA-256, UTF-8 JSON, lockfile version, root metadata, and target dependency range, then stores the exact bytes on the corresponding `ValidationRun`. The browser and signed PR ticket never contain the lockfile; the ticket carries only the validation-run ID.
+
+The only authorized PR file sets are `package.json`, or `package.json` plus that exact persisted `package-lock.json`. Missing, oversized, mismatched, differently bound, or unverifiable artifacts fail closed. `npm-shrinkwrap.json`, pnpm, Yarn, and Bun remain unsupported. Eligible no-lockfile repositories use `sentinel/deps/<sanitized-dependency>/<proposal-id>` and always create a GitHub Draft. Sentinel never writes the default branch, marks a PR ready for review, auto-merges, or runs PR creation in the background.
 
 PR request deduplication in memory is only an optimization. Cross-instance duplicate prevention uses a deterministic branch name derived from the signed proposal identity, GitHub's unique branch reference constraint, and the PR change marker lookup. If another instance already reserved the proposal's branch, Sentinel safely asks the user to refresh rather than creating a second PR.
 
@@ -83,7 +85,9 @@ When deployment is approved:
 4. Run `npx prisma migrate deploy` once in an authorized environment.
 5. Keep `SENTINEL_VALIDATION_ENABLED` unset and keep `SENTINEL_PR_CREATION_ENABLED` unset for the initial beta rollout.
 6. Deploy, then verify sign-in, repository listing, one dependency scan, dashboard history, and one user-triggered AI analysis.
-7. Only after the write workflow has been reviewed, deliberately enable `SENTINEL_PR_CREATION_ENABLED=true` and test a draft PR in a non-critical repository.
-8. Rotate OAuth, OpenAI, database, and Auth.js secrets on the established incident/rotation schedule; revoke and replace immediately if any secret is suspected to be exposed.
+7. For the npm artifact rollout, apply the backward-compatible Prisma migration first, deploy Vercel's optional-artifact consumer second, and deploy the Modal artifact producer third. Cloudflare requires no code change.
+8. Keep `SENTINEL_PR_CREATION_ENABLED` disabled while confirming one production validation persists a verified npm lockfile artifact.
+9. Only after the write workflow and persisted artifact are reviewed, deliberately enable `SENTINEL_PR_CREATION_ENABLED=true` for one controlled draft PR in a non-critical repository, then disable it again.
+10. Rotate OAuth, OpenAI, database, and Auth.js secrets on the established incident/rotation schedule; revoke and replace immediately if any secret is suspected to be exposed.
 
 Remaining deployment blockers: a canonical production domain, corresponding GitHub OAuth callback configuration, production environment values, an authorized migration run, and a production-safe isolated validation worker if repository command validation is required in the beta.

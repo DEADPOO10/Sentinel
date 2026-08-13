@@ -151,7 +151,7 @@ function DraftPullRequestResultCard({ result, validationStatus }: { result: Draf
 
 function getDraftPullRequestErrorTitle(category: Extract<DraftPullRequestActionResult, { kind: "error" }>["category"]) {
   if (category === "validation_required" || category === "repository_changed_since_validation" || category === "proposed_fix_stale") return "Revalidation required";
-  if (category === "validation_not_eligible" || category === "source_changes_not_allowed" || category === "lockfile_artifact_required") return "Not eligible";
+  if (category === "validation_not_eligible" || category === "source_changes_not_allowed" || category === "lockfile_artifact_required" || category === "validated_lockfile_required" || category === "validated_lockfile_invalid") return "Not eligible";
   if (category === "pr_creation_disabled") return "Draft PR creation disabled";
   if (category === "github_write_permission_required") return "GitHub write permission required";
   if (category === "branch_conflict") return "Draft PR already in progress";

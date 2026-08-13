@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { resolvePersistedProposedFixForValidation, type ProposedFixPersistenceInput } from "@/lib/db/proposed-fixes";
 import { getPrismaClient } from "@/lib/db/prisma";
 import type { ProposedFixValidationResult } from "@/lib/validation/proposed-fix-validation";
+import { isNpmPackageLockValidationBindingCurrent, verifyNpmPackageLockArtifact, type VerifiedNpmPackageLockArtifact } from "@/lib/validation/npm-package-lock-artifact";
 
 const VALIDATION_ATTEMPT_ID_PATTERN = /^[a-f\d]{8}-[a-f\d]{4}-[1-5][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
 const MAX_WARNINGS = 12;
@@ -23,11 +24,12 @@ const STAGE_STATUSES = new Map([
 ] as const);
 
 type ValidationPersistenceStage = "proposed_fix_resolved" | "validation_insert" | "validation_reuse_lookup";
-type ValidationPersistenceUnavailableCategory = "invalid_input" | "repository_not_connected" | "latest_scan_unavailable" | "latest_scan_mismatch" | "finding_not_found_or_changed" | "proposed_fix_not_found_or_changed" | "database_error";
+type ValidationPersistenceUnavailableCategory = "invalid_input" | "repository_not_connected" | "latest_scan_unavailable" | "latest_scan_mismatch" | "finding_not_found_or_changed" | "proposed_fix_not_found_or_changed" | "validation_artifact_mismatch" | "database_error";
 
 export type ValidationRunPersistenceInput = ProposedFixPersistenceInput & {
   validation: ProposedFixValidationResult;
   validationAttemptId: string;
+  validatedPackageLockArtifact: VerifiedNpmPackageLockArtifact | null;
 };
 
 export type ValidationRunPersistenceResult =
@@ -46,6 +48,10 @@ export type SavedValidationRun = {
   warnings: string[];
   createdAt: Date;
 };
+
+export type ValidatedPackageLockLookup =
+  | { kind: "ready"; artifact: VerifiedNpmPackageLockArtifact | null }
+  | { kind: "unavailable"; category: ValidationPersistenceUnavailableCategory | "validation_run_mismatch" };
 
 /** Persists one real validation completion for a current, exactly matching proposed fix. */
 export async function persistValidationRun(input: ValidationRunPersistenceInput): Promise<ValidationRunPersistenceResult> {
@@ -73,6 +79,9 @@ export async function persistValidationRun(input: ValidationRunPersistenceInput)
           testStatus: data.validation.checkStatuses.test,
           buildStatus: data.validation.checkStatuses.build,
           warningsJson: data.validation.warnings,
+          npmPackageLockContent: data.artifact ? Buffer.from(data.artifact.bytes) : null,
+          npmPackageLockByteLength: data.artifact?.byteLength ?? null,
+          npmPackageLockSha256: data.artifact?.sha256 ?? null,
         },
         select: { id: true },
       });
@@ -84,9 +93,9 @@ export async function persistValidationRun(input: ValidationRunPersistenceInput)
       stage = "validation_reuse_lookup";
       const existing = await client.validationRun.findUnique({
         where: { idempotencyKey },
-        select: { id: true, proposedFixId: true, baseCommitSha: true },
+        select: { id: true, proposedFixId: true, baseCommitSha: true, npmPackageLockContent: true, npmPackageLockByteLength: true, npmPackageLockSha256: true },
       });
-      if (existing && existing.proposedFixId === resolved.proposedFixId && existing.baseCommitSha === data.validation.baseCommitSha) {
+      if (existing && existing.proposedFixId === resolved.proposedFixId && existing.baseCommitSha === data.validation.baseCommitSha && storedArtifactMatches(existing, data.artifact)) {
         console.info("[sentinel:validation-persistence] validation_reused", { stage });
         return { kind: "existing", validationRunId: existing.id };
       }
@@ -98,8 +107,61 @@ export async function persistValidationRun(input: ValidationRunPersistenceInput)
   }
 }
 
+/** Reloads one exact validation-bound artifact after resolving the current user and proposal. */
+export async function getValidatedPackageLockArtifactForDraftPr(
+  validationRunId: string,
+  input: Omit<ValidationRunPersistenceInput, "validation" | "validationAttemptId" | "validatedPackageLockArtifact">,
+): Promise<ValidatedPackageLockLookup> {
+  const expectedBaseCommitSha = normalizeCommitSha(input.baseCommitSha);
+  if (!isSafeValidationRunId(validationRunId) || !expectedBaseCommitSha) return { kind: "unavailable", category: "validation_run_mismatch" };
+  try {
+    const resolved = await resolvePersistedProposedFixForValidation(input);
+    if (resolved.kind === "unavailable") return { kind: "unavailable", category: resolved.category };
+    const run = await getPrismaClient().validationRun.findUnique({
+      where: { id: validationRunId },
+      select: {
+        id: true,
+        proposedFixId: true,
+        baseCommitSha: true,
+        overallStatus: true,
+        installStatus: true,
+        typecheckStatus: true,
+        lintStatus: true,
+        testStatus: true,
+        buildStatus: true,
+        npmPackageLockContent: true,
+        npmPackageLockByteLength: true,
+        npmPackageLockSha256: true,
+      },
+    });
+    if (!run
+      || !isNpmPackageLockValidationBindingCurrent({
+        validationRunId: run.id,
+        proposedFixId: run.proposedFixId,
+        baseCommitSha: run.baseCommitSha,
+      }, {
+        validationRunId,
+        proposedFixId: resolved.proposedFixId,
+        baseCommitSha: expectedBaseCommitSha,
+      })
+      || run.installStatus !== "PASSED"
+      || !["PASSED", "PARTIAL"].includes(run.overallStatus)
+      || [run.typecheckStatus, run.lintStatus, run.testStatus, run.buildStatus].some((status) => status === "FAILED" || status === "TIMED_OUT")) {
+      return { kind: "unavailable", category: "validation_run_mismatch" };
+    }
+    if (run.npmPackageLockContent === null && run.npmPackageLockByteLength === null && run.npmPackageLockSha256 === null) {
+      return { kind: "ready", artifact: null };
+    }
+    const artifact = verifyStoredArtifact(run, input);
+    return artifact ? { kind: "ready", artifact } : { kind: "unavailable", category: "validation_artifact_mismatch" };
+  } catch (error) {
+    logPersistenceFailure("validation_reuse_lookup", error);
+    return { kind: "unavailable", category: "database_error" };
+  }
+}
+
 /** Returns recent historical validation runs only after re-verifying the current user and exact proposal. */
-export async function listValidationRunsForProposedFix(input: Omit<ValidationRunPersistenceInput, "validation" | "validationAttemptId">): Promise<SavedValidationRun[]> {
+export async function listValidationRunsForProposedFix(input: Omit<ValidationRunPersistenceInput, "validation" | "validationAttemptId" | "validatedPackageLockArtifact">): Promise<SavedValidationRun[]> {
   try {
     const resolved = await resolvePersistedProposedFixForValidation(input);
     if (resolved.kind === "unavailable") return [];
@@ -131,7 +193,7 @@ export async function listValidationRunsForProposedFix(input: Omit<ValidationRun
 }
 
 /** Returns the newest safely parsed validation record, without granting any PR authority. */
-export async function getLatestValidationRunForProposedFix(input: Omit<ValidationRunPersistenceInput, "validation" | "validationAttemptId">): Promise<SavedValidationRun | null> {
+export async function getLatestValidationRunForProposedFix(input: Omit<ValidationRunPersistenceInput, "validation" | "validationAttemptId" | "validatedPackageLockArtifact">): Promise<SavedValidationRun | null> {
   const runs = await listValidationRunsForProposedFix(input);
   return runs[0] ?? null;
 }
@@ -145,6 +207,7 @@ type PersistenceData = {
     checkStatuses: Record<(typeof VALIDATION_CHECK_NAMES)[number], "PASSED" | "FAILED" | "SKIPPED" | "TIMED_OUT">;
     warnings: string[];
   };
+  artifact: VerifiedNpmPackageLockArtifact | null;
 };
 
 function getPersistenceData(input: ValidationRunPersistenceInput): PersistenceData | null {
@@ -158,10 +221,57 @@ function getPersistenceData(input: ValidationRunPersistenceInput): PersistenceDa
   const warnings = getSafeWarnings(input.validation.warnings);
   if (!baseCommitSha || resultBaseCommitSha !== baseCommitSha || !overallStatus || !installStatus || !checkStatuses || !warnings) return null;
 
+  const artifact = input.validatedPackageLockArtifact;
+  if (artifact && verifyNpmPackageLockArtifact(toArtifactTransport(artifact), artifactExpectation(input)).kind !== "valid") return null;
   return {
     validationAttemptId: input.validationAttemptId.toLowerCase(),
     validation: { overallStatus, baseCommitSha, installStatus, checkStatuses, warnings },
+    artifact,
   };
+}
+
+function verifyStoredArtifact(value: { npmPackageLockContent: Uint8Array | null; npmPackageLockByteLength: number | null; npmPackageLockSha256: string | null }, input: ProposedFixPersistenceInput) {
+  if (!value.npmPackageLockContent || value.npmPackageLockByteLength === null || value.npmPackageLockSha256 === null) return null;
+  const verified = verifyNpmPackageLockArtifact({
+    kind: "npm_package_lock",
+    path: "package-lock.json",
+    encoding: "base64",
+    content: Buffer.from(value.npmPackageLockContent).toString("base64"),
+    byteLength: value.npmPackageLockByteLength,
+    sha256: value.npmPackageLockSha256,
+  }, artifactExpectation(input));
+  return verified.kind === "valid" ? verified.artifact : null;
+}
+
+function storedArtifactMatches(value: { npmPackageLockContent: Uint8Array | null; npmPackageLockByteLength: number | null; npmPackageLockSha256: string | null }, artifact: VerifiedNpmPackageLockArtifact | null) {
+  if (!artifact) return value.npmPackageLockContent === null && value.npmPackageLockByteLength === null && value.npmPackageLockSha256 === null;
+  return value.npmPackageLockByteLength === artifact.byteLength
+    && value.npmPackageLockSha256 === artifact.sha256
+    && value.npmPackageLockContent !== null
+    && Buffer.from(value.npmPackageLockContent).equals(Buffer.from(artifact.bytes));
+}
+
+function toArtifactTransport(artifact: VerifiedNpmPackageLockArtifact) {
+  return {
+    kind: artifact.kind,
+    path: artifact.path,
+    encoding: "base64" as const,
+    content: Buffer.from(artifact.bytes).toString("base64"),
+    byteLength: artifact.byteLength,
+    sha256: artifact.sha256,
+  };
+}
+
+function artifactExpectation(input: ProposedFixPersistenceInput) {
+  return {
+    dependencyName: input.dependency.packageName,
+    dependencyType: input.dependency.dependencyType,
+    targetVersion: input.dependency.latestVersion,
+  };
+}
+
+function isSafeValidationRunId(value: unknown) {
+  return typeof value === "string" && /^[A-Za-z\d_-]{1,64}$/.test(value);
 }
 
 function getIdempotencyKey(proposedFixId: string, baseCommitSha: string, validationAttemptId: string) {
