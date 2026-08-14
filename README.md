@@ -1,10 +1,18 @@
 # Sentinel
 
-## The AI maintenance engineer for dependency upgrades
+AI-powered dependency upgrade agent that analyzes, validates, and creates safe GitHub Draft PRs.
 
-Sentinel helps engineering teams keep JavaScript and TypeScript projects current without treating upgrades as blind version bumps. It discovers dependency changes, explains their likely impact in the context of a repository, prepares a focused upgrade, validates it in an isolated environment, and—only when a developer explicitly asks—opens a GitHub Draft Pull Request for review.
+Sentinel scans repository dependencies, uses AI to analyze upgrade impact, and runs isolated validation before proposing changes. Verified results can create GitHub Draft PRs, while developers remain in control of every review and merge decision.
 
 **Evidence first. Human review always.**
+
+## Why Sentinel
+
+- AI-powered dependency impact analysis
+- Isolated validation environment
+- Signed validation results
+- Safe dependency-only Draft PRs
+- Human review before merge
 
 ## What Sentinel does
 
