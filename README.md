@@ -45,7 +45,7 @@ Sentinel scans repository dependencies, uses AI to analyze upgrade impact, and r
 - Creates a GitHub **Draft** Pull Request only after validation and explicit user action.
 - Records maintenance activity, analyses, proposed fixes, validation runs, and pull requests in PostgreSQL.
 
-## The workflow
+## How Sentinel works
 
 ```text
 Detect change → Understand repository impact → Prepare a focused upgrade
@@ -56,6 +56,8 @@ Sentinel is deliberately not an autopilot. It never writes to a repository's def
 
 
 ## Architecture
+
+Sentinel separates analysis, AI reasoning, validation execution, and GitHub actions into isolated layers.
 
 ```mermaid
 flowchart TD
