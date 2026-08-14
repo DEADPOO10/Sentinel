@@ -15,6 +15,11 @@ AI-powered dependency upgrade agent that analyzes, validates, and creates safe G
   </a>
 </p>
 
+<p align="center">
+  <img src="docs/images/sentinel-analysis.png" alt="Sentinel AI dependency analysis" width="900"/>
+</p>
+
+
 Sentinel scans repository dependencies, uses AI to analyze upgrade impact, and runs isolated validation before proposing changes. Verified results can create GitHub Draft PRs, while developers remain in control of every review and merge decision.
 
 **Evidence first. Human review always.**
