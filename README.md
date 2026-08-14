@@ -19,7 +19,7 @@ AI-powered dependency upgrade agent that analyzes, validates, and creates safe G
 
 
 <p align="center">
-  <img src="docs/images/sentinel-analysis.png" alt="Sentinel AI dependency analysis" width="900"/>
+  <img src="docs/images/sentinel-analysis.png" alt="Sentinel AI dependency analysis" width="800"/>
 </p>
 
 
