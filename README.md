@@ -7,13 +7,16 @@
   <img src="https://img.shields.io/badge/TypeScript-Ready-blue?style=for-the-badge&logo=typescript" />
 </p>
 
+
 AI-powered dependency upgrade agent that analyzes, validates, and creates safe GitHub Draft PRs.
+
 
 <p align="center">
   <a href="https://sentinel-six-flax.vercel.app">
     <img src="https://img.shields.io/badge/Live_Demo-Visit_Sentinel-9FE870?style=for-the-badge" />
   </a>
 </p>
+
 
 <p align="center">
   <img src="docs/images/sentinel-analysis.png" alt="Sentinel AI dependency analysis" width="900"/>
