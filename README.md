@@ -54,18 +54,6 @@ Detect change → Understand repository impact → Prepare a focused upgrade
 
 Sentinel is deliberately not an autopilot. It never writes to a repository's default branch, marks a pull request ready for review, or auto-merges a change.
 
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Frontend | Next.js + TypeScript |
-| Authentication | Auth.js + GitHub OAuth |
-| Database | PostgreSQL + Prisma |
-| AI Analysis | OpenAI API |
-| Repository Integration | GitHub API |
-| Validation Worker | Modal isolated execution |
-| Deployment | Vercel |
-
 
 ## Architecture
 
@@ -84,6 +72,20 @@ flowchart TD
 ```
 
 Cloudflare forwards the validation request and does not execute customer code. Modal performs validation in isolation. Sentinel verifies the signed result and any returned lockfile artifact before its policy layer can permit a Draft PR; human approval remains mandatory.
+
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | Next.js + TypeScript |
+| Authentication | Auth.js + GitHub OAuth |
+| Database | PostgreSQL + Prisma |
+| AI Analysis | OpenAI API |
+| Repository Integration | GitHub API |
+| Validation Worker | Modal isolated execution |
+| Deployment | Vercel |
+
 
 ## Draft PR safety model
 
