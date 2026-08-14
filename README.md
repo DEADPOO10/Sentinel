@@ -81,9 +81,23 @@ The resulting GitHub Draft PR changed only `package.json` and `package-lock.json
 
 ## Product walkthrough
 
-1. Dependency scan and AI impact analysis
-2. Isolated validation result
-3. GitHub Draft PR
+### 1. AI impact analysis
+
+Sentinel analyzes the proposed dependency upgrade using repository context and release evidence before proposing a change.
+
+![Sentinel AI impact analysis](docs/images/sentinel-analysis.png)
+
+### 2. Isolated validation
+
+The proposed fix is validated in an isolated worker. Sentinel reports executed, skipped, and failed checks explicitly.
+
+![Sentinel isolated validation](docs/images/sentinel-validation.png)
+
+### 3. GitHub Draft PR
+
+After validation and policy checks, Sentinel can create a Draft PR for human review. Sentinel does not auto-merge.
+
+![Sentinel GitHub Draft PR](docs/images/sentinel-draft-pr.png)
 
 ## Stack
 
