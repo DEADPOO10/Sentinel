@@ -25,6 +25,24 @@ Detect change → Understand repository impact → Prepare a focused upgrade
 
 Sentinel is deliberately not an autopilot. It never writes to a repository's default branch, marks a pull request ready for review, or auto-merges a change.
 
+## Architecture
+
+```mermaid
+flowchart TD
+    developer["Developer"] --> app["Sentinel Web App<br/>Vercel"]
+    app --> repository["GitHub repository data<br/>Dependency scan"]
+    repository --> analysis["AI Impact Analysis<br/>Proposed Fix"]
+    analysis --> request["Validation request"]
+    request --> proxy["Cloudflare proxy<br/>credential-free forwarding"]
+    proxy --> worker["Modal isolated<br/>validation worker"]
+    worker --> result["Signed validation result<br/>optional npm lockfile artifact"]
+    result --> policy["Sentinel verification<br/>and policy layer"]
+    policy --> draft["GitHub Draft PR"]
+    draft --> review["Human review and approval<br/>no auto-merge"]
+```
+
+Cloudflare forwards the validation request and does not execute customer code. Modal performs validation in isolation. Sentinel verifies the signed result and any returned lockfile artifact before its policy layer can permit a Draft PR; human approval remains mandatory.
+
 ## Draft PR safety model
 
 Draft PR creation is opt-in and disabled unless `SENTINEL_PR_CREATION_ENABLED=true` is deliberately set. Before creating a branch, Sentinel requires a signed analysis/proposal/validation workflow and rechecks GitHub write access and the repository's current default-branch commit.
@@ -48,6 +66,24 @@ The included Modal worker validates immutable repository commits with:
 Sentinel verifies the signed result before using it, then requires the returned job ID and immutable repository commit to match the validation it initiated. The optional root `package-lock.json` artifact is bounded, verified by byte length and SHA-256, and is never sent to the browser.
 
 Read the full deployment and isolation requirements in [docs/VALIDATION_WORKER.md](docs/VALIDATION_WORKER.md).
+
+## Demo: validated dependency upgrade
+
+A controlled test upgraded `marked` from `^15.0.3` to `18.0.9`.
+
+- Install: Passed
+- Typecheck: Skipped
+- Lint: Passed
+- Tests: Passed
+- Build: Skipped
+
+The resulting GitHub Draft PR changed only `package.json` and `package-lock.json`. It required human review and was not auto-merged.
+
+## Product walkthrough
+
+1. Dependency scan and AI impact analysis
+2. Isolated validation result
+3. GitHub Draft PR
 
 ## Stack
 
