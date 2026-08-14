@@ -1,6 +1,19 @@
 # Sentinel
 
+<p align="center">
+  <img src="https://img.shields.io/badge/AI-Powered-9FE870?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/GitHub-Integration-181717?style=for-the-badge&logo=github" />
+  <img src="https://img.shields.io/badge/Next.js-15-black?style=for-the-badge&logo=next.js" />
+  <img src="https://img.shields.io/badge/TypeScript-Ready-blue?style=for-the-badge&logo=typescript" />
+</p>
+
 AI-powered dependency upgrade agent that analyzes, validates, and creates safe GitHub Draft PRs.
+
+<p align="center">
+  <a href="https://sentinel-six-flax.vercel.app">
+    <img src="https://img.shields.io/badge/Live_Demo-Visit_Sentinel-9FE870?style=for-the-badge" />
+  </a>
+</p>
 
 Sentinel scans repository dependencies, uses AI to analyze upgrade impact, and runs isolated validation before proposing changes. Verified results can create GitHub Draft PRs, while developers remain in control of every review and merge decision.
 
