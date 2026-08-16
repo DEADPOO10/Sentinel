@@ -14,6 +14,7 @@ import {
 } from "@/lib/github/draft-pull-request-policy";
 import { getGitHubAccessTokenForCurrentUser } from "@/lib/github/repositories";
 import { isValidGitHubRepository } from "@/lib/github/package-json";
+import { parseGitHubPullRequestResponseIdentity } from "@/lib/github/pull-request-response";
 import type { ImpactAnalysisSnapshot } from "@/lib/impact-analysis-ticket";
 import type { ProposedFix } from "@/lib/openai/proposed-fix";
 import type { ProposedFixValidationResult } from "@/lib/validation/proposed-fix-validation";
@@ -53,6 +54,8 @@ export type DraftPullRequestActionResult =
     kind: "created";
     prNumber: number;
     prUrl: string;
+    nodeId: string;
+    githubUpdatedAt: string;
     branchName: string;
     baseBranch: string;
     commitSha: string;
@@ -65,6 +68,8 @@ export type DraftPullRequestActionResult =
     kind: "existing";
     prNumber: number;
     prUrl: string;
+    nodeId: string;
+    githubUpdatedAt: string;
     branchName: string;
     baseBranch: string;
     commitSha: string;
@@ -79,6 +84,8 @@ type ExistingDraftPullRequestResult = {
   kind: "existing";
   prNumber: number;
   prUrl: string;
+  nodeId: string;
+  githubUpdatedAt: string;
   branchName: string;
   baseBranch: string;
   commitSha: string;
@@ -200,6 +207,8 @@ export async function createDraftPullRequestFromVerifiedChanges(input: VerifiedD
       kind: "created",
       prNumber: pullRequest.prNumber,
       prUrl: pullRequest.prUrl,
+      nodeId: pullRequest.nodeId,
+      githubUpdatedAt: pullRequest.githubUpdatedAt,
       branchName: createdBranch,
       baseBranch: input.defaultBranch,
       commitSha: createdCommitSha,
@@ -456,6 +465,8 @@ async function findExistingDraftPullRequest(input: VerifiedDraftPullRequestInput
     kind: "existing",
     prNumber: existing.prNumber,
     prUrl: existing.prUrl,
+    nodeId: existing.nodeId,
+    githubUpdatedAt: existing.githubUpdatedAt,
     branchName: existing.branchName,
     baseBranch: input.defaultBranch,
     commitSha: existing.commitSha,
@@ -620,17 +631,17 @@ function parseShaResponse(value: unknown) {
 }
 
 function parsePullRequest(value: unknown) {
-  if (!isRecord(value) || typeof value.number !== "number" || !Number.isSafeInteger(value.number) || typeof value.html_url !== "string" || value.draft !== true) return null;
-  return { prNumber: value.number, prUrl: value.html_url };
+  if (!isRecord(value) || value.draft !== true) return null;
+  return parseGitHubPullRequestResponseIdentity(value);
 }
 
 function parsePullRequestList(value: unknown) {
   if (!Array.isArray(value)) return null;
   const pullRequests = value.flatMap((item) => {
-    if (!isRecord(item) || typeof item.number !== "number" || !Number.isSafeInteger(item.number) || typeof item.html_url !== "string" || typeof item.body !== "string" || typeof item.draft !== "boolean" || !isRecord(item.head) || typeof item.head.ref !== "string" || typeof item.head.sha !== "string" || !isSafeGitSha(item.head.sha) || !isRecord(item.head.repo) || typeof item.head.repo.full_name !== "string") return [];
+    const identity = parseGitHubPullRequestResponseIdentity(item);
+    if (!identity || !isRecord(item) || typeof item.body !== "string" || typeof item.draft !== "boolean" || !isRecord(item.head) || typeof item.head.ref !== "string" || typeof item.head.sha !== "string" || !isSafeGitSha(item.head.sha) || !isRecord(item.head.repo) || typeof item.head.repo.full_name !== "string") return [];
     return [{
-      prNumber: item.number,
-      prUrl: item.html_url,
+      ...identity,
       body: item.body,
       draft: item.draft,
       branchName: item.head.ref,

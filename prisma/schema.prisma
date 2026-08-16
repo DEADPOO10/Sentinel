@@ -68,6 +68,7 @@ enum ValidationStageStatus {
 enum PullRequestStatus {
   DRAFT
   OPEN
+  READY_FOR_REVIEW
   CLOSED
   MERGED
 }
@@ -138,7 +139,7 @@ model Scan {
 }
 
 model Finding {
-  id                       String         @id @default(cuid())
+  id                       String          @id @default(cuid())
   scanId                   String
   packageName              String
   dependencyType           DependencyType
@@ -147,10 +148,10 @@ model Finding {
   changeType               ChangeType?
   risk                     RiskLevel?
   status                   FindingStatus
-  releaseEvidenceAvailable Boolean        @default(false)
-  repositoryUsageCount     Int            @default(0)
-  createdAt                DateTime       @default(now())
-  scan                     Scan           @relation(fields: [scanId], references: [id], onDelete: Restrict)
+  releaseEvidenceAvailable Boolean         @default(false)
+  repositoryUsageCount     Int             @default(0)
+  createdAt                DateTime        @default(now())
+  scan                     Scan            @relation(fields: [scanId], references: [id], onDelete: Restrict)
   impactAnalysis           ImpactAnalysis?
   proposedFix              ProposedFix?
 
@@ -159,16 +160,16 @@ model Finding {
 }
 
 model ImpactAnalysis {
-  id                String    @id @default(cuid())
-  findingId         String    @unique
-  risk              RiskLevel
-  confidence        Int
-  summary           String
-  potentialImpact   String
-  riskExplanation   String
-  recommendation    String
-  createdAt         DateTime  @default(now())
-  finding           Finding   @relation(fields: [findingId], references: [id], onDelete: Restrict)
+  id              String    @id @default(cuid())
+  findingId       String    @unique
+  risk            RiskLevel
+  confidence      Int
+  summary         String
+  potentialImpact String
+  riskExplanation String
+  recommendation  String
+  createdAt       DateTime  @default(now())
+  finding         Finding   @relation(fields: [findingId], references: [id], onDelete: Restrict)
 }
 
 model ProposedFix {
@@ -191,40 +192,56 @@ model ProposedFix {
 }
 
 model ValidationRun {
-  id              String                  @id @default(cuid())
-  proposedFixId   String
-  idempotencyKey  String?                 @unique
-  overallStatus   ValidationOverallStatus
-  baseCommitSha   String
-  installStatus   ValidationStageStatus
-  typecheckStatus ValidationStageStatus?
-  lintStatus      ValidationStageStatus?
-  testStatus      ValidationStageStatus?
-  buildStatus     ValidationStageStatus?
-  warningsJson    Json
-  npmPackageLockContent Bytes?
+  id                       String                  @id @default(cuid())
+  proposedFixId            String
+  idempotencyKey           String?                 @unique
+  overallStatus            ValidationOverallStatus
+  baseCommitSha            String
+  installStatus            ValidationStageStatus
+  typecheckStatus          ValidationStageStatus?
+  lintStatus               ValidationStageStatus?
+  testStatus               ValidationStageStatus?
+  buildStatus              ValidationStageStatus?
+  warningsJson             Json
+  npmPackageLockContent    Bytes?
   npmPackageLockByteLength Int?
-  npmPackageLockSha256 String?
-  createdAt       DateTime                @default(now())
-  proposedFix     ProposedFix             @relation(fields: [proposedFixId], references: [id], onDelete: Restrict)
+  npmPackageLockSha256     String?
+  createdAt                DateTime                @default(now())
+  proposedFix              ProposedFix             @relation(fields: [proposedFixId], references: [id], onDelete: Restrict)
 
   @@index([proposedFixId, createdAt])
   @@index([overallStatus])
 }
 
 model PullRequest {
-  id              String            @id @default(cuid())
-  proposedFixId   String            @unique
-  githubPrNumber  Int
-  githubPrUrl     String
-  branchName      String
-  baseBranch      String
-  commitSha       String
-  draft           Boolean           @default(true)
-  status          PullRequestStatus @default(DRAFT)
-  createdAt       DateTime          @default(now())
-  proposedFix     ProposedFix       @relation(fields: [proposedFixId], references: [id], onDelete: Restrict)
+  id                String                  @id @default(cuid())
+  proposedFixId     String                  @unique
+  githubPrNumber    Int
+  githubPrNodeId    String?                 @unique
+  githubPrUrl       String
+  branchName        String
+  baseBranch        String
+  commitSha         String
+  draft             Boolean                 @default(true)
+  status            PullRequestStatus       @default(DRAFT)
+  githubUpdatedAt   DateTime?
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+  proposedFix       ProposedFix             @relation(fields: [proposedFixId], references: [id], onDelete: Restrict)
+  webhookDeliveries GitHubWebhookDelivery[]
 
   @@index([githubPrNumber])
   @@index([status])
+}
+
+model GitHubWebhookDelivery {
+  deliveryId      String      @id
+  event           String
+  action          String
+  pullRequestId   String
+  githubUpdatedAt DateTime?
+  processedAt     DateTime    @default(now())
+  pullRequest     PullRequest @relation(fields: [pullRequestId], references: [id], onDelete: Cascade)
+
+  @@index([pullRequestId, processedAt])
 }

@@ -5,6 +5,7 @@ import { resolvePersistedProposedFixForValidation, type ProposedFixPersistenceIn
 import { getPrismaClient } from "@/lib/db/prisma";
 import type { DraftPullRequestActionResult } from "@/lib/github/draft-pull-request";
 import { isValidGitHubRepository } from "@/lib/github/package-json";
+import { getGitHubPullRequestPersistenceFields } from "@/lib/github/pull-request-response";
 
 const MAX_RECENT_PULL_REQUESTS = 20;
 const GIT_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/;
@@ -33,7 +34,7 @@ export type SavedPullRequest = {
   baseBranch: string;
   commitSha: string;
   draft: boolean;
-  status: "draft" | "open" | "closed" | "merged";
+  status: "draft" | "open" | "ready_for_review" | "closed" | "merged";
   createdAt: Date;
 };
 
@@ -66,21 +67,25 @@ export async function persistPullRequestForProposedFix(input: PullRequestPersist
         create: {
           proposedFixId: resolved.proposedFixId,
           githubPrNumber: data.githubPrNumber,
+          githubPrNodeId: data.githubPrNodeId,
           githubPrUrl: data.githubPrUrl,
           branchName: data.branchName,
           baseBranch: data.baseBranch,
           commitSha: data.commitSha,
           draft: data.draft,
           status: data.status,
+          githubUpdatedAt: data.githubUpdatedAt,
         },
         update: {
           githubPrNumber: data.githubPrNumber,
+          githubPrNodeId: data.githubPrNodeId,
           githubPrUrl: data.githubPrUrl,
           branchName: data.branchName,
           baseBranch: data.baseBranch,
           commitSha: data.commitSha,
           draft: data.draft,
           status: data.status,
+          githubUpdatedAt: data.githubUpdatedAt,
         },
         select: { id: true },
       });
@@ -102,12 +107,14 @@ export async function persistPullRequestForProposedFix(input: PullRequestPersist
         where: { proposedFixId: resolved.proposedFixId },
         data: {
           githubPrNumber: data.githubPrNumber,
+          githubPrNodeId: data.githubPrNodeId,
           githubPrUrl: data.githubPrUrl,
           branchName: data.branchName,
           baseBranch: data.baseBranch,
           commitSha: data.commitSha,
           draft: data.draft,
           status: data.status,
+          githubUpdatedAt: data.githubUpdatedAt,
         },
         select: { id: true },
       });
@@ -198,12 +205,14 @@ export async function listRecentPullRequestsForRepository(githubRepositoryId: nu
 
 type PersistenceData = {
   githubPrNumber: number;
+  githubPrNodeId: string;
   githubPrUrl: string;
   branchName: string;
   baseBranch: string;
   commitSha: string;
   draft: boolean;
-  status: "DRAFT" | "OPEN";
+  status: "DRAFT" | "READY_FOR_REVIEW";
+  githubUpdatedAt: Date;
 };
 
 function getPersistenceData(input: PullRequestPersistenceInput): PersistenceData | null {
@@ -219,7 +228,8 @@ function getPersistenceData(input: PullRequestPersistenceInput): PersistenceData
   const branchName = getSafeGitReference(pullRequest.branchName);
   const baseBranch = getSafeGitReference(pullRequest.baseBranch);
   const commitSha = getSafeGitSha(pullRequest.commitSha);
-  if (!githubPrNumber || !githubPrUrl || !branchName || !baseBranch || !commitSha
+  const lifecycle = getGitHubPullRequestPersistenceFields(pullRequest);
+  if (!githubPrNumber || !githubPrUrl || !branchName || !baseBranch || !commitSha || !lifecycle
     || !branchName.startsWith("sentinel/")
     || baseBranch !== input.defaultBranch
     || pullRequest.dependencyName !== identity.dependency.packageName
@@ -230,12 +240,14 @@ function getPersistenceData(input: PullRequestPersistenceInput): PersistenceData
 
   return {
     githubPrNumber,
+    githubPrNodeId: lifecycle.githubPrNodeId,
     githubPrUrl,
     branchName,
     baseBranch,
     commitSha,
     draft: pullRequest.draft,
-    status: pullRequest.draft ? "DRAFT" : "OPEN",
+    status: lifecycle.status,
+    githubUpdatedAt: lifecycle.githubUpdatedAt,
   };
 }
 
@@ -246,7 +258,7 @@ function toSavedPullRequest(value: {
   baseBranch: string;
   commitSha: string;
   draft: boolean;
-  status: "DRAFT" | "OPEN" | "CLOSED" | "MERGED";
+  status: "DRAFT" | "OPEN" | "READY_FOR_REVIEW" | "CLOSED" | "MERGED";
   createdAt: Date;
 }): SavedPullRequest | null {
   const githubPrNumber = getSafePullRequestNumber(value.githubPrNumber);
@@ -312,6 +324,7 @@ function getSafeText(value: unknown, maximumLength: number) {
 function getSavedStatus(value: unknown): SavedPullRequest["status"] | null {
   if (value === "DRAFT") return "draft";
   if (value === "OPEN") return "open";
+  if (value === "READY_FOR_REVIEW") return "ready_for_review";
   if (value === "CLOSED") return "closed";
   if (value === "MERGED") return "merged";
   return null;

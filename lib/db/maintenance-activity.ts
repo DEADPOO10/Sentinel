@@ -244,7 +244,7 @@ function createPullRequestActivity(
     githubPrNumber: number;
     githubPrUrl: string;
     draft: boolean;
-    status: "DRAFT" | "OPEN" | "CLOSED" | "MERGED";
+    status: "DRAFT" | "OPEN" | "READY_FOR_REVIEW" | "CLOSED" | "MERGED";
     createdAt: Date;
   },
 ): MaintenanceActivity[] {
@@ -258,7 +258,7 @@ function createPullRequestActivity(
     dependencyName,
     action: `${isDraft ? "Draft PR" : "Pull request"} #${pullRequest.githubPrNumber} created`,
     status: isDraft ? "DRAFT" : pullRequest.status,
-    tone: isDraft || pullRequest.status === "OPEN" ? "info" : "default",
+    tone: isDraft || pullRequest.status === "OPEN" || pullRequest.status === "READY_FOR_REVIEW" ? "info" : "default",
     occurredAt: pullRequest.createdAt,
     pullRequest: { number: pullRequest.githubPrNumber, url },
   })];
