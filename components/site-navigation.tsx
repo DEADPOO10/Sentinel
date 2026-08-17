@@ -1,11 +1,75 @@
 import Link from "next/link";
-import { SignOutButton } from "@/components/auth-buttons";
+import { ShieldCheck } from "lucide-react";
+import {
+  SignOutButton,
+  SiteNavigationLinks,
+} from "@/components/auth-buttons";
 import { Button } from "@/components/ui/button";
 import { getCurrentUser } from "@/lib/auth/session";
-import { ShieldCheck } from "lucide-react";
 
 export async function SiteNavigation() {
   const user = await getCurrentUser();
   const isAuthenticated = Boolean(user);
-  return <nav className="sticky top-0 z-30 border-b border-[#d5d6ce] bg-[#f5f5ef]/95 backdrop-blur"><div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-6 lg:px-8"><Link href="/" className="flex items-center gap-2.5 font-medium tracking-[-.04em] text-[#171817]"><span className="grid h-7 w-7 place-items-center border border-[#171817] bg-[#d8ff42] text-[#171817]"><ShieldCheck className="h-4 w-4" /></span><span>sentinel</span></Link>{isAuthenticated ? <div className="flex items-center gap-1 sm:gap-5"><Link href="/dashboard" className="hidden text-sm text-[#696b66] transition-colors hover:text-[#171817] sm:inline">Dashboard</Link><Link href="/repositories" className="hidden text-sm text-[#696b66] transition-colors hover:text-[#171817] sm:inline">Repositories</Link><Link href="/settings" className="text-sm text-[#696b66] transition-colors hover:text-[#171817]">Settings</Link><SignOutButton /></div> : <div className="flex items-center gap-4"><Link href="/" className="hidden text-sm text-[#696b66] transition-colors hover:text-[#171817] sm:inline">Home</Link><Link href="/login" className="hidden text-sm text-[#696b66] transition-colors hover:text-[#171817] sm:inline">Login</Link><Button asChild size="sm"><Link href="/login">Get Started</Link></Button></div>}</div></nav>;
+  const userLabel =
+    user?.username ?? user?.name ?? user?.email ?? "GitHub user";
+  const userInitial = userLabel.trim().charAt(0).toUpperCase() || "S";
+
+  return (
+    <nav
+      aria-label="Global navigation"
+      className="sticky top-0 z-30 border-b border-[#d5d6ce] bg-[#f5f5ef]/95 backdrop-blur"
+    >
+      <div className="mx-auto flex h-[4.5rem] max-w-7xl items-center justify-between gap-4 px-6 lg:px-8">
+        <Link
+          href="/"
+          aria-label="Sentinel home"
+          className="group flex shrink-0 items-center gap-3 text-[#171817] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#171817] focus-visible:ring-offset-2 focus-visible:ring-offset-[#f5f5ef]"
+        >
+          <span className="relative grid h-9 w-9 place-items-center border border-[#171817] bg-[#d8ff42] text-[#171817] transition-transform group-hover:-translate-y-0.5">
+            <ShieldCheck className="h-5 w-5" />
+            <span className="absolute -right-1 -top-1 h-2 w-2 border border-[#171817] bg-[#f5f5ef]" />
+          </span>
+          <span>
+            <span className="block text-base font-medium tracking-[-.045em]">
+              sentinel
+            </span>
+            <span className="hidden font-mono text-[8px] uppercase tracking-[.14em] text-[#8a8d86] xl:block">
+              Maintenance intelligence
+            </span>
+          </span>
+        </Link>
+
+        {isAuthenticated ? (
+          <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+            <SiteNavigationLinks authenticated />
+
+            <div className="hidden items-center gap-2.5 border-l border-[#d5d6ce] pl-3 xl:flex">
+              <span className="grid h-8 w-8 shrink-0 place-items-center border border-[#171817] bg-[#ecece5] font-mono text-xs font-medium text-[#171817]">
+                {userInitial}
+              </span>
+              <span className="max-w-36 min-w-0">
+                <span className="block truncate text-xs font-medium text-[#171817]">
+                  {userLabel}
+                </span>
+                <span className="block font-mono text-[8px] uppercase tracking-[.1em] text-[#8a8d86]">
+                  GitHub workspace
+                </span>
+              </span>
+            </div>
+
+            <SignOutButton />
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 sm:gap-3">
+            <div className="hidden sm:block">
+              <SiteNavigationLinks authenticated={false} />
+            </div>
+            <Button asChild size="sm">
+              <Link href="/login">Get Started</Link>
+            </Button>
+          </div>
+        )}
+      </div>
+    </nav>
+  );
 }
