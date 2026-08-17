@@ -194,7 +194,20 @@ def create_api(replay_reserver: ReplayReserver | None = None):
     return api
 
 
-@app.function(image=WORKER_IMAGE, secrets=[modal.Secret.from_name(SECRET_NAME)], timeout=300, cpu=(1.0, 1.0), memory=(2048, 2048), max_containers=2)
+@app.function(
+    image=WORKER_IMAGE,
+    secrets=[
+        modal.Secret.from_name(SECRET_NAME),
+        modal.Secret.from_name(
+            "sentinel-validation-rollout",
+            required_keys=[LEGACY_SIGNATURE_COMPATIBILITY_ENV],
+        ),
+    ],
+    timeout=300,
+    cpu=(1.0, 1.0),
+    memory=(2048, 2048),
+    max_containers=2,
+)
 @modal.asgi_app()
 def web():
     return create_api()
