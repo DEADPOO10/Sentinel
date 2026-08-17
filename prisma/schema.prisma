@@ -73,6 +73,22 @@ enum PullRequestStatus {
   MERGED
 }
 
+enum RateLimitOperation {
+  OPENAI_REQUEST
+  REPOSITORY_SCAN
+  VALIDATION_JOB
+}
+
+enum RateLimitScope {
+  USER
+  REPOSITORY
+}
+
+enum RateLimitWindow {
+  SHORT
+  DAILY
+}
+
 model User {
   id           String           @id @default(cuid())
   githubUserId String           @unique
@@ -244,4 +260,20 @@ model GitHubWebhookDelivery {
   pullRequest     PullRequest @relation(fields: [pullRequestId], references: [id], onDelete: Cascade)
 
   @@index([pullRequestId, processedAt])
+}
+
+model RateLimitBucket {
+  id           String             @id @default(cuid())
+  operation    RateLimitOperation
+  scope        RateLimitScope
+  window       RateLimitWindow
+  subjectKey   String
+  windowStart  DateTime
+  requestCount Int                @default(0)
+  expiresAt    DateTime
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  @@unique([operation, scope, window, subjectKey, windowStart])
+  @@index([expiresAt])
 }

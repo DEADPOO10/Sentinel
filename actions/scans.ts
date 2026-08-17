@@ -3,6 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { requireUser } from "@/lib/auth/session";
 import { connectRepositoryToCurrentSentinelUser } from "@/lib/db/repositories";
+import { getRateLimitMessage, reserveCostlyOperation } from "@/lib/db/rate-limits";
 import { createCompletedScanWithFindings } from "@/lib/db/scans";
 import { getGitHubPackageManifestForRepository, getGitHubRepositoryDetails, isValidGitHubRepository } from "@/lib/github/package-json";
 import { logger } from "@/lib/logger";
@@ -56,6 +57,23 @@ async function refreshRepositoryScanWithContext(input: { owner: string; reposito
       category: "repository_connection_failed",
     }));
     return { kind: "error", error: "Sentinel could not connect this repository to your workspace." };
+  }
+
+  const rateLimit = await reserveCostlyOperation({
+    operation: "REPOSITORY_SCAN",
+    userId: user.id,
+    githubRepositoryId: repositoryResult.repository.githubRepositoryId,
+  });
+  if (rateLimit.kind !== "allowed") {
+    logger.warn("repository_scan.rate_limit_rejected", logContext({
+      outcome: "rejected",
+      category: rateLimit.kind === "limited" ? "limit_exceeded" : "limiter_unavailable",
+      ...(rateLimit.kind === "limited" ? {
+        scope: rateLimit.scope,
+        window: rateLimit.window,
+      } : {}),
+    }));
+    return { kind: "error", error: getRateLimitMessage("REPOSITORY_SCAN", rateLimit) };
   }
 
   const startedAt = new Date();

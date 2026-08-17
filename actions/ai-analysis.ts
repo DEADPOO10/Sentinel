@@ -4,6 +4,7 @@ import { requireUser } from "@/lib/auth/session";
 import { persistImpactAnalysisForFinding } from "@/lib/db/impact-analyses";
 import { persistPullRequestForProposedFix } from "@/lib/db/pull-requests";
 import { persistProposedFixForFinding } from "@/lib/db/proposed-fixes";
+import { getRateLimitMessage, reserveCostlyOperation } from "@/lib/db/rate-limits";
 import { getValidatedPackageLockArtifactForDraftPr, persistValidationRun } from "@/lib/db/validation-runs";
 import { getRepositoryDependencyUsage, type RepositoryUsageContext } from "@/lib/github/dependency-usage";
 import { createDraftPullRequestFromVerifiedChanges, getGitHubRepositoryBaseForCurrentUser, type DraftPullRequestActionResult as GitHubDraftPullRequestActionResult } from "@/lib/github/draft-pull-request";
@@ -36,6 +37,15 @@ export async function requestDependencyImpactAnalysis(input: { owner: string; re
   const dependency = result.manifest.dependencies.find((item) => item.name === input.dependencyName && item.type === input.dependencyType);
   if (!dependency || dependency.status !== "update-available" || !dependency.latestVersion || !dependency.changeType || !dependency.risk) {
     return { error: "AI analysis is available only for dependencies with an update available." };
+  }
+
+  const rateLimit = await reserveCostlyOperation({
+    operation: "OPENAI_REQUEST",
+    userId: user.id,
+    githubRepositoryId: result.repository.githubRepositoryId,
+  });
+  if (rateLimit.kind !== "allowed") {
+    return { error: getRateLimitMessage("OPENAI_REQUEST", rateLimit) };
   }
 
   const [repositoryUsageResult, releaseInformationResult] = await Promise.allSettled([
@@ -140,6 +150,15 @@ export async function requestProposedFix(input: { owner: string; repository: str
   const latestVersion = dependency.latestVersion;
   const changeType = dependency.changeType;
   const risk = dependency.risk;
+
+  const rateLimit = await reserveCostlyOperation({
+    operation: "OPENAI_REQUEST",
+    userId: user.id,
+    githubRepositoryId: result.repository.githubRepositoryId,
+  });
+  if (rateLimit.kind !== "allowed") {
+    return { kind: "error", error: getRateLimitMessage("OPENAI_REQUEST", rateLimit) };
+  }
 
   const proposedFixContext = await (async () => {
     const [repositoryUsage, releaseInformation] = await Promise.all([
@@ -261,6 +280,15 @@ async function requestProposedFixValidationForCurrentUser(input: ProposedFixVali
   if (!dependency || dependency.status !== "update-available" || !dependency.latestVersion || !dependency.changeType || !dependency.risk) {
     logSafeProposedFixActionEvent("validation_preflight_failed", { category: "dependency_not_eligible" });
     return validationActionResult(createUnableToValidateResult("This dependency no longer has a validated update available."));
+  }
+
+  const rateLimit = await reserveCostlyOperation({
+    operation: "VALIDATION_JOB",
+    userId,
+    githubRepositoryId: packageJsonResult.repository.githubRepositoryId,
+  });
+  if (rateLimit.kind !== "allowed") {
+    return validationActionResult(createUnableToValidateResult(getRateLimitMessage("VALIDATION_JOB", rateLimit)));
   }
 
   const repositoryBase = await getGitHubRepositoryBaseForCurrentUser(packageJsonResult.repository.owner, packageJsonResult.repository.name);
