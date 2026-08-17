@@ -7,7 +7,7 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 
-from worker.core import POLICY, ValidationError, inspect_github_zip, parse_and_validate_job, request_auth_failure_reason, sign, verify_signature, verify_timestamp
+from worker.core import POLICY, ValidationError, inspect_github_zip, parse_and_validate_job, request_auth_failure_reason, request_signed_message, sign, sign_request, verify_request_signature, verify_signature, verify_timestamp
 
 
 def job():
@@ -30,31 +30,44 @@ class CoreTests(unittest.TestCase):
         secret = "shared secret"
         body = b'{"jobId":"example"}'
         now = str(int(time.time() * 1000))
-        signature = sign(secret, body)
+        signature = sign_request(secret, now, body)
         self.assertEqual(request_auth_failure_reason(secret, body, None, now), "missing_headers")
         self.assertEqual(request_auth_failure_reason(secret, body, signature, None), "missing_headers")
         self.assertEqual(request_auth_failure_reason(secret, body, signature, "not-a-timestamp"), "timestamp_invalid")
-        self.assertEqual(request_auth_failure_reason(secret, body, signature, str(int((time.time() - 301) * 1000))), "timestamp_invalid")
-        self.assertEqual(request_auth_failure_reason(secret, body, sign("other secret", body), now), "signature_mismatch")
+        expired = str(int((time.time() - 301) * 1000))
+        self.assertEqual(request_auth_failure_reason(secret, body, sign_request(secret, expired, body), expired), "timestamp_invalid")
+        self.assertEqual(request_auth_failure_reason(secret, body, sign_request("other secret", now, body), now), "signature_mismatch")
         self.assertIsNone(request_auth_failure_reason(secret, body, signature, now))
+
+    def test_request_signature_binds_version_timestamp_and_exact_body(self):
+        secret = "shared secret"
+        timestamp = str(int(time.time() * 1000))
+        body = b'{"jobId":"example"}'
+        signature = sign_request(secret, timestamp, body)
+
+        self.assertEqual(request_signed_message(timestamp, body), b"v1\n" + timestamp.encode("ascii") + b"\n" + body)
+        self.assertTrue(verify_request_signature(secret, timestamp, body, signature))
+        self.assertFalse(verify_request_signature(secret, str(int(timestamp) + 1), body, signature))
+        self.assertFalse(verify_request_signature(secret, timestamp, body + b" ", signature))
 
     def test_typescript_contract_signature_is_accepted_by_python(self):
         root = Path(__file__).resolve().parents[2]
         secret = "cross-language fixture secret; not a production credential"
+        timestamp = "1786896000000"
         payload = b'{"message":"caf\xc3\xa9","version":1}'
         script = """
-import { signWorkerMessageSignature } from './lib/validation/worker-contract.ts';
-const [secret, encodedPayload] = process.argv.slice(1);
-console.log(signWorkerMessageSignature(secret, Buffer.from(encodedPayload, 'base64').toString('utf8')));
+import { signValidationWorkerRequest } from './lib/validation/worker-contract.ts';
+const [secret, timestamp, encodedPayload] = process.argv.slice(1);
+console.log(signValidationWorkerRequest(secret, timestamp, Buffer.from(encodedPayload, 'base64').toString('utf8')));
 """
         signature = subprocess.run(
-            ["node", "--experimental-strip-types", "--input-type=module", "--eval", script, secret, base64.b64encode(payload).decode("ascii")],
+            ["node", "--experimental-strip-types", "--input-type=module", "--eval", script, secret, timestamp, base64.b64encode(payload).decode("ascii")],
             cwd=root,
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
-        self.assertTrue(verify_signature(secret, payload, signature))
+        self.assertTrue(verify_request_signature(secret, timestamp, payload, signature))
 
     def test_job_requires_exact_policy_and_safe_paths(self):
         parsed = parse_and_validate_job(job())

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash, createHmac } from "node:crypto";
-import { isAllowedValidationCommand, isSafeArchiveEntryPath, isSafeWorkerResult, MAX_WORKER_TEXT_LENGTH, VALIDATION_WORKER_MAX_DURATION_MS, VALIDATION_WORKER_POLICY, signWorkerMessageSignature, verifyWorkerMessageSignature, workerHttpErrorDiagnostics, workerResultValidationFailure, type ValidationWorkerResult } from "../lib/validation/worker-contract.ts";
+import { isAllowedValidationCommand, isSafeArchiveEntryPath, isSafeWorkerResult, MAX_WORKER_TEXT_LENGTH, VALIDATION_WORKER_MAX_DURATION_MS, VALIDATION_WORKER_POLICY, signValidationWorkerRequest, signWorkerMessageSignature, validationWorkerRequestSignedMessage, verifyValidationWorkerRequestSignature, verifyWorkerMessageSignature, workerHttpErrorDiagnostics, workerResultValidationFailure, type ValidationWorkerResult } from "../lib/validation/worker-contract.ts";
 import { parseSignedWorkerResponse, readBoundedWorkerResponseText, workerResponseBindingFailure } from "../lib/validation/worker-response.ts";
 import { MAX_NPM_PACKAGE_LOCK_ARTIFACT_BYTES, createNpmPackageLockArtifactTransport, isNpmPackageLockValidationBindingCurrent, verifyNpmPackageLockArtifact } from "../lib/validation/npm-package-lock-artifact.ts";
 
@@ -45,6 +45,20 @@ test("the worker's documented validation budget is five minutes", () => {
   assert.equal(VALIDATION_WORKER_MAX_DURATION_MS, 300_000);
   assert.equal(VALIDATION_WORKER_POLICY.execution.maxDurationMs, VALIDATION_WORKER_MAX_DURATION_MS);
   assert.equal(VALIDATION_WORKER_POLICY.execution.maxCommandDurationMs, 120_000);
+});
+
+test("validation request signatures bind version, timestamp, and exact body", () => {
+  const secret = "a sufficiently long worker shared secret";
+  const timestamp = "1786896000000";
+  const body = '{"message":"café","version":1}';
+  const signedMessage = `v1\n${timestamp}\n${body}`;
+  const signature = signValidationWorkerRequest(secret, timestamp, body);
+
+  assert.equal(validationWorkerRequestSignedMessage(timestamp, body), signedMessage);
+  assert.equal(signature, createHmac("sha256", secret).update(signedMessage).digest("base64url"));
+  assert.equal(verifyValidationWorkerRequestSignature(secret, timestamp, body, signature), true);
+  assert.equal(verifyValidationWorkerRequestSignature(secret, `${Number(timestamp) + 1}`, body, signature), false);
+  assert.equal(verifyValidationWorkerRequestSignature(secret, timestamp, `${body} `, signature), false);
 });
 
 test("HTTP failure diagnostics contain only a status and determined upstream category", () => {

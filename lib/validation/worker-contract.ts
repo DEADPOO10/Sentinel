@@ -53,6 +53,28 @@ export function signWorkerMessageSignature(secret: string, payload: string) {
   return createHmac("sha256", secret).update(payload).digest("base64url");
 }
 
+/** Signs the request version, exact timestamp header, and exact UTF-8 JSON body. */
+export function signValidationWorkerRequest(secret: string, timestamp: string, payload: string) {
+  return signWorkerMessageSignature(secret, validationWorkerRequestSignedMessage(timestamp, payload));
+}
+
+export function verifyValidationWorkerRequestSignature(
+  secret: string,
+  timestamp: string,
+  payload: string,
+  signature: string,
+) {
+  return verifyWorkerMessageSignature(
+    secret,
+    validationWorkerRequestSignedMessage(timestamp, payload),
+    signature,
+  );
+}
+
+export function validationWorkerRequestSignedMessage(timestamp: string, payload: string) {
+  return `v1\n${timestamp}\n${payload}`;
+}
+
 /** Safe metadata for non-successful HTTP responses; never includes body data. */
 export function workerHttpErrorDiagnostics(status: number, endpoint: URL) {
   const host = endpoint.hostname.toLowerCase();

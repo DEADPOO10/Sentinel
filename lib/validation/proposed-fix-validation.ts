@@ -10,7 +10,7 @@ import {
   MAX_WORKER_RESPONSE_BYTES,
   VALIDATION_WORKER_MAX_DURATION_MS,
   VALIDATION_WORKER_POLICY,
-  signWorkerMessageSignature,
+  signValidationWorkerRequest,
   workerHttpErrorDiagnostics,
   verifyWorkerMessageSignature,
   type ValidationWorkerRequest,
@@ -171,6 +171,7 @@ function getWorkerConfig(): WorkerConfigResult {
 
 async function invokeValidationWorker(config: WorkerConfig, request: ValidationWorkerRequest): Promise<ValidationWorkerResult> {
   const body = JSON.stringify(request);
+  const timestamp = String(Date.now());
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), PROPOSED_FIX_VALIDATION_LIMITS.maxTotalDurationMs);
   try {
@@ -178,8 +179,8 @@ async function invokeValidationWorker(config: WorkerConfig, request: ValidationW
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-sentinel-request-signature": signPayload(config.sharedSecret, body),
-        "x-sentinel-request-timestamp": String(Date.now()),
+        "x-sentinel-request-signature": signValidationWorkerRequest(config.sharedSecret, timestamp, body),
+        "x-sentinel-request-timestamp": timestamp,
       },
       body,
       cache: "no-store",
@@ -223,7 +224,6 @@ function execution(validation: ProposedFixValidationResult, validatedPackageLock
 }
 
 function isSafeGitCommitSha(value: string) { return /^[a-f\d]{40,64}$/i.test(value); }
-function signPayload(secret: string, payload: string) { return signWorkerMessageSignature(secret, payload); }
 export function verifyWorkerResponseSignature(secret: string, payload: string, signature: string) { return verifyWorkerMessageSignature(secret, payload, signature); }
 function getWorkerFetchFailureReason(error: unknown) {
   if (error instanceof DOMException && error.name === "AbortError") return "timeout";

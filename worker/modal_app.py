@@ -14,12 +14,12 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable, Literal
 
 import modal
 from fastapi import Request
 
-from worker.core import CHECK_NAMES, MAX_ARCHIVE_COMPRESSED_BYTES, MAX_COMMAND_OUTPUT_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, POLICY, ValidationError, canonical_json, inspect_github_zip, parse_and_validate_job, request_auth_failure_reason, result_for_error, sign
+from worker.core import CHECK_NAMES, MAX_ARCHIVE_COMPRESSED_BYTES, MAX_COMMAND_OUTPUT_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, POLICY, ValidationError, canonical_json, inspect_github_zip, parse_and_validate_job, request_auth_failure_reason, result_for_error, sign, verify_signature
 
 APP_NAME = "sentinel-validation-worker"
 SECRET_NAME = "sentinel-validation-worker"
@@ -58,6 +58,16 @@ SANDBOX_IMAGE = (
 )
 app = modal.App(APP_NAME)
 logger = logging.getLogger("sentinel.validation_worker")
+# Modal Dict entries are durable across containers and expire after seven days
+# of inactivity under Modal's storage contract. The application stores only a
+# domain-separated digest, never a request signature or body.
+REQUEST_REPLAY_CACHE = modal.Dict.from_name(
+    "sentinel-validation-request-replay-v1",
+    create_if_missing=True,
+)
+SignatureScheme = Literal["v1", "legacy"]
+ReplayReserver = Callable[[SignatureScheme, str], Awaitable[bool]]
+LEGACY_SIGNATURE_COMPATIBILITY_ENV = "SENTINEL_VALIDATION_ACCEPT_LEGACY_SIGNATURES"
 
 TRUSTED_SANDBOX_AGENT_PATH = Path("/opt/sentinel/worker/sandbox_agent.py")
 SANDBOX_AGENT_REMOTE_PATH = "/tmp/sentinel/sandbox_agent.py"
@@ -117,11 +127,12 @@ SAFE_SANDBOX_FAILURE_STAGES = frozenset(
 )
 
 
-def create_api():
+def create_api(replay_reserver: ReplayReserver | None = None):
     from fastapi import FastAPI
     from fastapi.responses import Response
 
     api = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    reserve_replay = replay_reserver or reserve_validation_request
 
     @api.post("/v1/validations")
     async def validate(request: Request) -> Response:
@@ -133,14 +144,45 @@ def create_api():
         if len(raw) > MAX_REQUEST_BYTES:
             log_request_auth_failure("request_too_large")
             return signed_error(secret, job, "Worker request could not be authenticated.", "invalid_request_authentication", 401)
-        auth_failure = request_auth_failure_reason(secret, raw, request.headers.get("x-sentinel-request-signature"), request.headers.get("x-sentinel-request-timestamp"))
+        request_signature = request.headers.get("x-sentinel-request-signature")
+        request_timestamp = request.headers.get("x-sentinel-request-timestamp")
+        auth_failure = request_auth_failure_reason(secret, raw, request_signature, request_timestamp)
+        signature_scheme: SignatureScheme = "v1"
+        if auth_failure == "signature_mismatch" and legacy_signature_compatibility_enabled():
+            # The rollout bridge is available only to otherwise-valid jobs.
+            # Parsing before legacy verification prevents malformed or
+            # unsupported bodies from entering the fallback path.
+            try:
+                legacy_job = parse_and_validate_job(json.loads(raw))
+            except (ValidationError, json.JSONDecodeError):
+                legacy_job = None
+            if legacy_job is not None and verify_signature(secret, raw, request_signature):
+                job = legacy_job
+                signature_scheme = "legacy"
+                auth_failure = None
         if auth_failure:
             log_request_auth_failure(auth_failure)
             return signed_error(secret, job, "Worker request could not be authenticated.", "invalid_request_authentication", 401)
+        if request_signature is None:
+            # request_auth_failure_reason rejects this condition above. Keep a
+            # fail-closed guard so the replay store never receives bad input.
+            log_request_auth_failure("missing_headers")
+            return signed_error(secret, job, "Worker request could not be authenticated.", "invalid_request_authentication", 401)
         try:
-            job = parse_and_validate_job(json.loads(raw))
-        except (ValidationError, json.JSONDecodeError) as error:
-            return signed_error(secret, job, "The validation job could not be safely prepared.", getattr(error, "args", ["invalid_job"])[0], 422)
+            replay_reserved = await reserve_replay(signature_scheme, request_signature)
+        except Exception:
+            log_request_auth_failure("replay_store_unavailable")
+            return signed_error(secret, job, "Worker replay protection is temporarily unavailable.", "worker_replay_protection_unavailable", 503)
+        if not replay_reserved:
+            log_request_auth_failure("replay_detected")
+            return signed_error(secret, job, "Worker request could not be authenticated.", "invalid_request_authentication", 401)
+        if signature_scheme == "legacy":
+            log_legacy_signature_accepted()
+        if job is None:
+            try:
+                job = parse_and_validate_job(json.loads(raw))
+            except (ValidationError, json.JSONDecodeError) as error:
+                return signed_error(secret, job, "The validation job could not be safely prepared.", getattr(error, "args", ["invalid_job"])[0], 422)
         try:
             return signed_json(secret, await execute_job(job), 200)
         except ValidationError as error:
@@ -730,9 +772,36 @@ def signed_error(secret: str, job: dict[str, Any] | None, summary: str, warning:
     return signed_json(secret, result_for_error(job, summary, warning), status)
 
 
+def legacy_signature_compatibility_enabled() -> bool:
+    """Enable the temporary bridge only for one exact, explicit value."""
+    return os.environ.get(LEGACY_SIGNATURE_COMPATIBILITY_ENV) == "true"
+
+
+def replay_cache_key(signature_scheme: SignatureScheme, signature: str) -> str:
+    """Return a domain-separated digest without retaining the signature."""
+    if signature_scheme not in {"v1", "legacy"}:
+        raise ValueError("unsupported_signature_scheme")
+    material = b"sentinel-validation-replay\x00" + signature_scheme.encode("ascii") + b"\x00" + signature.encode("ascii")
+    return hashlib.sha256(material).hexdigest()
+
+
+async def reserve_validation_request(signature_scheme: SignatureScheme, signature: str) -> bool:
+    """Atomically reserve an authenticated request across all worker containers."""
+    return await REQUEST_REPLAY_CACHE.put.aio(
+        replay_cache_key(signature_scheme, signature),
+        int(time.time()),
+        skip_if_exists=True,
+    )
+
+
 def log_request_auth_failure(reason: str) -> None:
     # Reasons are fixed labels only: never log credentials, signatures, or body data.
     logger.warning("validation request authentication rejected: reason=%s", reason)
+
+
+def log_legacy_signature_accepted() -> None:
+    # Fixed event only: never log the compatibility flag, signature, or body.
+    logger.warning("[sentinel:validation-worker] legacy_signature_accepted")
 
 
 def log_sandbox_failure(stage: str) -> None:

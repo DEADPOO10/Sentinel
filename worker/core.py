@@ -66,9 +66,27 @@ def verify_signature(secret: str, body: bytes, signature: str | None) -> bool:
     return hmac.compare_digest(sign(secret, body), signature)
 
 
-def verify_timestamp(value: str | None, *, now: float | None = None) -> bool:
+def request_signed_message(timestamp: str, body: bytes) -> bytes:
+    return b"v1\n" + timestamp.encode("ascii") + b"\n" + body
+
+
+def sign_request(secret: str, timestamp: str, body: bytes) -> str:
+    return sign(secret, request_signed_message(timestamp, body))
+
+
+def verify_request_signature(secret: str, timestamp: str, body: bytes, signature: str | None) -> bool:
     try:
-        timestamp_ms = int(value or "")
+        signed_message = request_signed_message(timestamp, body)
+    except UnicodeEncodeError:
+        return False
+    return verify_signature(secret, signed_message, signature)
+
+
+def verify_timestamp(value: str | None, *, now: float | None = None) -> bool:
+    if not value or not re.fullmatch(r"\d{13}", value):
+        return False
+    try:
+        timestamp_ms = int(value)
     except ValueError:
         return False
     current = time.time() if now is None else now
@@ -81,7 +99,7 @@ def request_auth_failure_reason(secret: str, body: bytes, signature: str | None,
         return "missing_headers"
     if not verify_timestamp(timestamp):
         return "timestamp_invalid"
-    if not verify_signature(secret, body, signature):
+    if not verify_request_signature(secret, timestamp, body, signature):
         return "signature_mismatch"
     return None
 

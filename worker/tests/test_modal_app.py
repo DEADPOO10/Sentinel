@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
-from worker.core import CHECK_NAMES, MAX_COMMAND_OUTPUT_BYTES, POLICY, ValidationError, canonical_json, sign, verify_signature
-from worker.modal_app import CHECK_TIMEOUT_SECONDS, CLEANUP_RESERVE_SECONDS, MAX_NPM_PACKAGE_LOCK_ARTIFACT_BYTES, MAX_RESULT_SUMMARY_CHARS, SANDBOX_AGENT_REMOTE_PATH, SANDBOX_USER_PREFIX, TOTAL_VALIDATION_DURATION_SECONDS, TRUNCATED_OUTPUT_NOTICE, VALIDATION_EXECUTION_BUDGET_SECONDS, cleanup_sandbox, command_summary, command_timeout_seconds, create_api, create_npm_package_lock_artifact, execute_job, install_argv, normalize_command_output, npm_lockfile_sync_argv, read_bounded_output, run_validation_checks, trusted_sandbox_agent_path
+from worker.core import CHECK_NAMES, MAX_COMMAND_OUTPUT_BYTES, POLICY, ValidationError, canonical_json, sign, sign_request, verify_signature
+from worker.modal_app import CHECK_TIMEOUT_SECONDS, CLEANUP_RESERVE_SECONDS, LEGACY_SIGNATURE_COMPATIBILITY_ENV, MAX_NPM_PACKAGE_LOCK_ARTIFACT_BYTES, MAX_RESULT_SUMMARY_CHARS, SANDBOX_AGENT_REMOTE_PATH, SANDBOX_USER_PREFIX, TOTAL_VALIDATION_DURATION_SECONDS, TRUNCATED_OUTPUT_NOTICE, VALIDATION_EXECUTION_BUDGET_SECONDS, cleanup_sandbox, command_summary, command_timeout_seconds, create_api, create_npm_package_lock_artifact, execute_job, install_argv, legacy_signature_compatibility_enabled, normalize_command_output, npm_lockfile_sync_argv, read_bounded_output, replay_cache_key, reserve_validation_request, run_validation_checks, trusted_sandbox_agent_path
 
 
 def valid_job():
@@ -30,6 +30,23 @@ def valid_job():
             "warnings": [],
         },
         "policy": POLICY,
+    }
+
+
+def successful_result():
+    job = valid_job()
+    return {
+        "version": 1,
+        "jobId": job["jobId"],
+        "repository": {"commitSha": job["repository"]["commitSha"]},
+        "overallStatus": "passed",
+        "install": {"status": "passed", "summary": "Completed."},
+        "checks": [
+            {"name": name, "status": "passed", "durationMs": 1, "summary": "Completed."}
+            for name in CHECK_NAMES
+        ],
+        "warnings": [],
+        "partialReasons": [],
     }
 
 
@@ -140,7 +157,10 @@ class ModalAppTests(unittest.TestCase):
         """An HTTP request must not be mistaken for a required query parameter."""
         with patch.dict(
             os.environ,
-            {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": "x" * 32},
+            {
+                "SENTINEL_VALIDATION_WORKER_SHARED_SECRET": "x" * 32,
+                LEGACY_SIGNATURE_COMPATIBILITY_ENV: "false",
+            },
             clear=False,
         ):
             response = TestClient(create_api()).post(
@@ -158,10 +178,17 @@ class ModalAppTests(unittest.TestCase):
         timestamp = str(int(time.time() * 1000))
         cases = [
             ({}, "missing_headers"),
-            ({"x-sentinel-request-signature": sign(secret, body), "x-sentinel-request-timestamp": "invalid"}, "timestamp_invalid"),
-            ({"x-sentinel-request-signature": sign("y" * 32, body), "x-sentinel-request-timestamp": timestamp}, "signature_mismatch"),
+            ({"x-sentinel-request-signature": sign_request(secret, "invalid", body), "x-sentinel-request-timestamp": "invalid"}, "timestamp_invalid"),
+            ({"x-sentinel-request-signature": sign_request("y" * 32, timestamp, body), "x-sentinel-request-timestamp": timestamp}, "signature_mismatch"),
         ]
-        with patch.dict(os.environ, {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret}, clear=False):
+        with patch.dict(
+            os.environ,
+            {
+                "SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret,
+                LEGACY_SIGNATURE_COMPATIBILITY_ENV: "false",
+            },
+            clear=False,
+        ):
             client = TestClient(create_api())
             for headers, reason in cases:
                 with self.assertLogs("sentinel.validation_worker", level="WARNING") as logs:
@@ -172,15 +199,16 @@ class ModalAppTests(unittest.TestCase):
     def test_authenticated_async_failure_returns_a_signed_safe_stage_reason(self):
         secret = "x" * 32
         body = canonical_json(valid_job())
+        timestamp = str(int(time.time() * 1000))
         headers = {
             "content-type": "application/json",
-            "x-sentinel-request-signature": sign(secret, body),
-            "x-sentinel-request-timestamp": str(int(time.time() * 1000)),
+            "x-sentinel-request-signature": sign_request(secret, timestamp, body),
+            "x-sentinel-request-timestamp": timestamp,
         }
-        with patch.dict(os.environ, {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret}, clear=False), patch(
+        with patch.dict(os.environ, {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret, LEGACY_SIGNATURE_COMPATIBILITY_ENV: "false"}, clear=False), patch(
             "worker.modal_app.execute_job", new=AsyncMock(side_effect=ValidationError("sandbox_create_failed"))
         ):
-            response = TestClient(create_api()).post("/v1/validations", content=body, headers=headers)
+            response = TestClient(create_api(replay_reserver=AsyncMock(return_value=True))).post("/v1/validations", content=body, headers=headers)
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["overallStatus"], "unable_to_validate")
@@ -189,8 +217,288 @@ class ModalAppTests(unittest.TestCase):
         self.assertTrue(verify_signature(secret, response.content, signature))
         self.assertFalse(verify_signature(secret, response.content + b" ", signature))
 
+    def test_valid_authenticated_request_is_accepted_once_and_replay_is_rejected(self):
+        secret = "x" * 32
+        body = canonical_json(valid_job())
+        timestamp = str(int(time.time() * 1000))
+        headers = {
+            "content-type": "application/json",
+            "x-sentinel-request-signature": sign_request(secret, timestamp, body),
+            "x-sentinel-request-timestamp": timestamp,
+        }
+        replay_reserver = AsyncMock(side_effect=[True, False])
+        execute = AsyncMock(return_value=successful_result())
+        with patch.dict(os.environ, {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret, LEGACY_SIGNATURE_COMPATIBILITY_ENV: "false"}, clear=False), patch(
+            "worker.modal_app.execute_job", new=execute
+        ):
+            client = TestClient(create_api(replay_reserver=replay_reserver))
+            accepted = client.post("/v1/validations", content=body, headers=headers)
+            replayed = client.post("/v1/validations", content=body, headers=headers)
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json()["overallStatus"], "passed")
+        self.assertEqual(replayed.status_code, 401)
+        self.assertEqual(replayed.json()["warnings"], ["invalid_request_authentication"])
+        self.assertEqual(execute.await_count, 1)
+        self.assertEqual(replay_reserver.await_count, 2)
+        self.assertEqual(replay_reserver.await_args_list[0].args, ("v1", headers["x-sentinel-request-signature"]))
+
+    def test_legacy_signature_is_rejected_when_compatibility_is_disabled(self):
+        secret = "x" * 32
+        body = canonical_json(valid_job())
+        timestamp = str(int(time.time() * 1000))
+        headers = {
+            "content-type": "application/json",
+            "x-sentinel-request-signature": sign(secret, body),
+            "x-sentinel-request-timestamp": timestamp,
+        }
+        replay_reserver = AsyncMock(return_value=True)
+        with patch.dict(
+            os.environ,
+            {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret},
+            clear=True,
+        ):
+            response = TestClient(create_api(replay_reserver=replay_reserver)).post(
+                "/v1/validations", content=body, headers=headers
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["warnings"], ["invalid_request_authentication"])
+        replay_reserver.assert_not_awaited()
+
+    def test_legacy_signature_is_accepted_only_when_enabled(self):
+        secret = "x" * 32
+        body = canonical_json(valid_job())
+        timestamp = str(int(time.time() * 1000))
+        legacy_signature = sign(secret, body)
+        headers = {
+            "content-type": "application/json",
+            "x-sentinel-request-signature": legacy_signature,
+            "x-sentinel-request-timestamp": timestamp,
+        }
+        replay_reserver = AsyncMock(return_value=True)
+        with patch.dict(
+            os.environ,
+            {
+                "SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret,
+                LEGACY_SIGNATURE_COMPATIBILITY_ENV: "true",
+            },
+            clear=False,
+        ), patch("worker.modal_app.execute_job", new=AsyncMock(return_value=successful_result())), self.assertLogs(
+            "sentinel.validation_worker", level="WARNING"
+        ) as logs:
+            response = TestClient(create_api(replay_reserver=replay_reserver)).post(
+                "/v1/validations", content=body, headers=headers
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["overallStatus"], "passed")
+        self.assertEqual(
+            logs.output,
+            ["WARNING:sentinel.validation_worker:[sentinel:validation-worker] legacy_signature_accepted"],
+        )
+        replay_reserver.assert_awaited_once_with("legacy", legacy_signature)
+        self.assertTrue(
+            verify_signature(secret, response.content, response.headers["x-sentinel-worker-signature"])
+        )
+
+    def test_invalid_legacy_signature_is_rejected_when_compatibility_is_enabled(self):
+        secret = "x" * 32
+        body = canonical_json(valid_job())
+        timestamp = str(int(time.time() * 1000))
+        replay_reserver = AsyncMock(return_value=True)
+        with patch.dict(
+            os.environ,
+            {
+                "SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret,
+                LEGACY_SIGNATURE_COMPATIBILITY_ENV: "true",
+            },
+            clear=False,
+        ):
+            response = TestClient(create_api(replay_reserver=replay_reserver)).post(
+                "/v1/validations",
+                content=body,
+                headers={
+                    "content-type": "application/json",
+                    "x-sentinel-request-signature": sign("y" * 32, body),
+                    "x-sentinel-request-timestamp": timestamp,
+                },
+            )
+
+        self.assertEqual(response.status_code, 401)
+        replay_reserver.assert_not_awaited()
+
+    def test_malformed_v1_request_does_not_enter_legacy_fallback(self):
+        secret = "x" * 32
+        body = b"not-json"
+        timestamp = str(int(time.time() * 1000))
+        replay_reserver = AsyncMock(return_value=True)
+        with patch.dict(
+            os.environ,
+            {
+                "SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret,
+                LEGACY_SIGNATURE_COMPATIBILITY_ENV: "true",
+            },
+            clear=False,
+        ), patch("worker.modal_app.log_legacy_signature_accepted") as legacy_log:
+            response = TestClient(create_api(replay_reserver=replay_reserver)).post(
+                "/v1/validations",
+                content=body,
+                headers={
+                    "content-type": "application/json",
+                    "x-sentinel-request-signature": sign_request(secret, timestamp, body),
+                    "x-sentinel-request-timestamp": timestamp,
+                },
+            )
+
+        self.assertEqual(response.status_code, 422)
+        legacy_log.assert_not_called()
+        replay_reserver.assert_awaited_once()
+
+    def test_malformed_legacy_request_is_not_accepted_by_fallback(self):
+        secret = "x" * 32
+        body = b"{}"
+        timestamp = str(int(time.time() * 1000))
+        replay_reserver = AsyncMock(return_value=True)
+        with patch.dict(
+            os.environ,
+            {
+                "SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret,
+                LEGACY_SIGNATURE_COMPATIBILITY_ENV: "true",
+            },
+            clear=False,
+        ), patch("worker.modal_app.log_legacy_signature_accepted") as legacy_log:
+            response = TestClient(create_api(replay_reserver=replay_reserver)).post(
+                "/v1/validations",
+                content=body,
+                headers={
+                    "content-type": "application/json",
+                    "x-sentinel-request-signature": sign(secret, body),
+                    "x-sentinel-request-timestamp": timestamp,
+                },
+            )
+
+        self.assertEqual(response.status_code, 401)
+        legacy_log.assert_not_called()
+        replay_reserver.assert_not_awaited()
+
+    def test_stale_v1_timestamp_is_rejected_without_fallback(self):
+        secret = "x" * 32
+        body = canonical_json(valid_job())
+        timestamp = str(int((time.time() - 301) * 1000))
+        replay_reserver = AsyncMock(return_value=True)
+        with patch.dict(
+            os.environ,
+            {
+                "SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret,
+                LEGACY_SIGNATURE_COMPATIBILITY_ENV: "true",
+            },
+            clear=False,
+        ):
+            response = TestClient(create_api(replay_reserver=replay_reserver)).post(
+                "/v1/validations",
+                content=body,
+                headers={
+                    "content-type": "application/json",
+                    "x-sentinel-request-signature": sign_request(secret, timestamp, body),
+                    "x-sentinel-request-timestamp": timestamp,
+                },
+            )
+
+        self.assertEqual(response.status_code, 401)
+        replay_reserver.assert_not_awaited()
+
+    def test_stale_legacy_timestamp_is_rejected_without_fallback(self):
+        secret = "x" * 32
+        body = canonical_json(valid_job())
+        timestamp = str(int((time.time() - 301) * 1000))
+        replay_reserver = AsyncMock(return_value=True)
+        with patch.dict(
+            os.environ,
+            {
+                "SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret,
+                LEGACY_SIGNATURE_COMPATIBILITY_ENV: "true",
+            },
+            clear=False,
+        ):
+            response = TestClient(create_api(replay_reserver=replay_reserver)).post(
+                "/v1/validations",
+                content=body,
+                headers={
+                    "content-type": "application/json",
+                    "x-sentinel-request-signature": sign(secret, body),
+                    "x-sentinel-request-timestamp": timestamp,
+                },
+            )
+
+        self.assertEqual(response.status_code, 401)
+        replay_reserver.assert_not_awaited()
+
+    def test_replayed_legacy_request_is_rejected(self):
+        secret = "x" * 32
+        body = canonical_json(valid_job())
+        timestamp = str(int(time.time() * 1000))
+        signature = sign(secret, body)
+        headers = {
+            "content-type": "application/json",
+            "x-sentinel-request-signature": signature,
+            "x-sentinel-request-timestamp": timestamp,
+        }
+        replay_reserver = AsyncMock(side_effect=[True, False])
+        execute = AsyncMock(return_value=successful_result())
+        with patch.dict(
+            os.environ,
+            {
+                "SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret,
+                LEGACY_SIGNATURE_COMPATIBILITY_ENV: "true",
+            },
+            clear=False,
+        ), patch("worker.modal_app.execute_job", new=execute):
+            client = TestClient(create_api(replay_reserver=replay_reserver))
+            accepted = client.post("/v1/validations", content=body, headers=headers)
+            replayed = client.post("/v1/validations", content=body, headers=headers)
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(replayed.status_code, 401)
+        self.assertEqual(execute.await_count, 1)
+        self.assertEqual(replay_reserver.await_args_list[0].args, ("legacy", signature))
+
+    def test_compatibility_flag_fails_closed(self):
+        for value in (None, "", "TRUE", "1", " true "):
+            environment = {} if value is None else {LEGACY_SIGNATURE_COMPATIBILITY_ENV: value}
+            with self.subTest(value=value), patch.dict(os.environ, environment, clear=True):
+                self.assertFalse(legacy_signature_compatibility_enabled())
+        with patch.dict(os.environ, {LEGACY_SIGNATURE_COMPATIBILITY_ENV: "true"}, clear=True):
+            self.assertTrue(legacy_signature_compatibility_enabled())
+
 
 class ModalAsyncExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_replay_reservation_uses_atomic_durable_modal_dict_write(self):
+        put = AioOnlyCall(return_value=True)
+        replay_cache = SimpleNamespace(put=put)
+        signature = "a" * 43
+        with patch("worker.modal_app.REQUEST_REPLAY_CACHE", replay_cache):
+            reserved = await reserve_validation_request("v1", signature)
+
+        self.assertTrue(reserved)
+        put.aio.assert_awaited_once()
+        call = put.aio.await_args
+        self.assertEqual(len(call.args[0]), 64)
+        self.assertNotEqual(call.args[0], signature)
+        self.assertIsInstance(call.args[1], int)
+        self.assertEqual(call.kwargs, {"skip_if_exists": True})
+
+    def test_replay_cache_keys_are_domain_separated_and_digest_only(self):
+        signature = "a" * 43
+        v1_key = replay_cache_key("v1", signature)
+        legacy_key = replay_cache_key("legacy", signature)
+
+        self.assertEqual(len(v1_key), 64)
+        self.assertEqual(len(legacy_key), 64)
+        self.assertNotEqual(v1_key, legacy_key)
+        self.assertNotIn(signature, v1_key)
+        self.assertNotIn(signature, legacy_key)
+
     def test_trusted_agent_path_requires_the_baked_outer_worker_file(self):
         from worker import modal_app
 
