@@ -1,8 +1,18 @@
 import { parsePullRequestWebhookPayload, isSupportedPullRequestWebhookAction } from "./pull-request-webhook.ts";
 import { verifyGitHubWebhookSignature } from "./webhook-signature.ts";
 import type { PullRequestLifecycleProcessingInput, PullRequestLifecycleProcessingResult } from "../db/pull-request-lifecycle.ts";
+import { logger } from "../logger.ts";
+import { createOperationId, getOperationId, withOperationId } from "../observability/context.ts";
 
 export const GITHUB_WEBHOOK_MAX_BODY_BYTES = 1024 * 1024;
+const GITHUB_WEBHOOK_MINIMUM_SECRET_LENGTH = 32;
+const OBVIOUS_WEBHOOK_SECRET_PATTERN = /^(?:example|changeme|test|secret|default|placeholder|replaceme)+$/;
+const OBVIOUS_WEBHOOK_SECRET_VALUES = new Set([
+  "githubwebhooksecret",
+  "replacewitharandomwebhooksecret",
+  "yourgithubwebhooksecret",
+  "yourwebhooksecret",
+]);
 
 type GitHubWebhookRouteDependencies = {
   getSecret(): string | undefined;
@@ -12,60 +22,121 @@ type GitHubWebhookRouteDependencies = {
 class WebhookBodyTooLargeError extends Error {}
 
 export function createGitHubWebhookPostHandler(dependencies: GitHubWebhookRouteDependencies) {
-  return async function handleGitHubWebhook(request: Request): Promise<Response> {
-    if (!isJsonContentType(request.headers.get("content-type"))) {
-      return safeResponse(415, "unsupported_content_type");
-    }
-
-    const event = getSafeHeader(request.headers.get("x-github-event"), 64);
-    const deliveryId = getSafeHeader(request.headers.get("x-github-delivery"), 100);
-    const signature = request.headers.get("x-hub-signature-256");
-    if (!event || !deliveryId) return safeResponse(400, "missing_required_header");
-    if (!signature) return safeResponse(401, "invalid_signature");
-
-    const secret = dependencies.getSecret()?.trim();
-    if (!secret) return safeResponse(503, "webhook_not_configured");
-
-    let rawBody: Uint8Array;
-    try {
-      rawBody = await readBoundedBody(request, GITHUB_WEBHOOK_MAX_BODY_BYTES);
-    } catch (error) {
-      if (error instanceof WebhookBodyTooLargeError) return safeResponse(413, "payload_too_large");
-      return safeResponse(400, "body_unavailable");
-    }
-
-    if (!verifyGitHubWebhookSignature(secret, signature, rawBody).valid) {
-      return safeResponse(401, "invalid_signature");
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(rawBody)) as unknown;
-    } catch {
-      return safeResponse(400, "malformed_json");
-    }
-
-    if (event === "ping") return safeResponse(200, "accepted");
-    if (event !== "pull_request") return safeResponse(202, "ignored_event");
-
-    const action = getPayloadAction(parsed);
-    if (!action) return safeResponse(400, "malformed_payload");
-    if (!isSupportedPullRequestWebhookAction(action)) return safeResponse(202, "ignored_action");
-
-    const payload = parsePullRequestWebhookPayload(parsed);
-    if (!payload) return safeResponse(400, "malformed_payload");
-
-    try {
-      const result = await dependencies.processPullRequest({ deliveryId, payload });
-      return safeResponse(200, result.kind);
-    } catch {
-      console.error("[sentinel:github-webhook] processing_failed", {
-        stage: "database_transaction",
-        category: "retryable_database_error",
-      });
-      return safeResponse(500, "processing_failed");
-    }
+  return function handleGitHubWebhook(request: Request): Promise<Response> {
+    const operationId = getOperationId() ?? createOperationId();
+    return withOperationId(
+      operationId,
+      () => handleGitHubWebhookWithContext(request, dependencies),
+    );
   };
+}
+
+async function handleGitHubWebhookWithContext(
+  request: Request,
+  dependencies: GitHubWebhookRouteDependencies,
+): Promise<Response> {
+  const startedAt = Date.now();
+  let eventType: string | null = null;
+  let deliveryIdForLogs: string | null = null;
+  const respond = (
+    status: number,
+    result: string,
+    metadata: Record<string, unknown> = {},
+    repositoryIdentifier?: string,
+  ) => {
+    const context = {
+      service: "sentinel-github-webhook",
+      repositoryIdentifier,
+      durationMs: Date.now() - startedAt,
+      metadata: {
+        result,
+        httpStatus: status,
+        ...(eventType ? { eventType } : {}),
+        ...(deliveryIdForLogs ? { deliveryId: deliveryIdForLogs } : {}),
+        ...metadata,
+      },
+    };
+    if (status >= 500) logger.error("github_webhook.completed", context);
+    else if (status >= 400) logger.warn("github_webhook.completed", context);
+    else logger.info("github_webhook.completed", context);
+    return safeResponse(status, result);
+  };
+
+  if (!isJsonContentType(request.headers.get("content-type"))) {
+    return respond(415, "unsupported_content_type");
+  }
+
+  const event = getSafeHeader(request.headers.get("x-github-event"), 64);
+  const deliveryId = getSafeHeader(request.headers.get("x-github-delivery"), 100);
+  const signature = request.headers.get("x-hub-signature-256");
+  eventType = event;
+  deliveryIdForLogs = deliveryId;
+  if (!event || !deliveryId) return respond(400, "missing_required_header");
+  if (!signature) return respond(401, "invalid_signature");
+
+  const secret = getConfiguredWebhookSecret(dependencies.getSecret());
+  if (!secret) return respond(503, "webhook_not_configured");
+
+  logger.info("github_webhook.started", {
+    service: "sentinel-github-webhook",
+    metadata: { eventType: event, deliveryId },
+  });
+
+  let rawBody: Uint8Array;
+  try {
+    rawBody = await readBoundedBody(request, GITHUB_WEBHOOK_MAX_BODY_BYTES);
+  } catch (error) {
+    if (error instanceof WebhookBodyTooLargeError) return respond(413, "payload_too_large");
+    return respond(400, "body_unavailable");
+  }
+
+  if (!verifyGitHubWebhookSignature(secret, signature, rawBody).valid) {
+    return respond(401, "invalid_signature");
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(rawBody)) as unknown;
+  } catch {
+    return respond(400, "malformed_json");
+  }
+
+  if (event === "ping") return respond(200, "accepted");
+  if (event !== "pull_request") return respond(202, "ignored_event");
+
+  const action = getPayloadAction(parsed);
+  if (!action) return respond(400, "malformed_payload");
+  if (!isSupportedPullRequestWebhookAction(action)) return respond(202, "ignored_action");
+
+  const payload = parsePullRequestWebhookPayload(parsed);
+  if (!payload) return respond(400, "malformed_payload", { action });
+
+  try {
+    const result = await dependencies.processPullRequest({ deliveryId, payload });
+    return respond(200, result.kind, { action }, payload.repository.githubRepositoryId);
+  } catch {
+    return respond(500, "processing_failed", {
+      action,
+      stage: "database_transaction",
+      category: "retryable_database_error",
+    }, payload.repository.githubRepositoryId);
+  }
+}
+
+function getConfiguredWebhookSecret(value: string | undefined) {
+  const secret = value?.trim();
+  if (!secret || secret.length < GITHUB_WEBHOOK_MINIMUM_SECRET_LENGTH) return null;
+
+  const normalized = secret.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (
+    !normalized
+    || OBVIOUS_WEBHOOK_SECRET_PATTERN.test(normalized)
+    || OBVIOUS_WEBHOOK_SECRET_VALUES.has(normalized)
+  ) {
+    return null;
+  }
+
+  return secret;
 }
 
 async function readBoundedBody(request: Request, maximumBytes: number) {

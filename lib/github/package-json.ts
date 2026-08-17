@@ -1,4 +1,5 @@
 import { getGitHubAccessTokenForCurrentUser } from "@/lib/github/repositories";
+import { logger } from "@/lib/logger";
 import { checkDependencyVersions, type CheckedPackageManifest } from "@/lib/npm/dependency-versions";
 
 const GITHUB_API_ORIGIN = "https://api.github.com/";
@@ -90,31 +91,110 @@ export async function getGitHubPackageManifest(owner: string, repository: string
  * commit reads deliberately remain a later stage so the header can stream.
  */
 export async function getGitHubRepositoryDetails(owner: string, repository: string): Promise<GitHubRepositoryDetailsResult> {
-  if (!isValidGitHubRepository(owner, repository)) return { kind: "not-found" };
+  const operationId = crypto.randomUUID();
+  const startedAt = Date.now();
+  const repositoryIdentifier = `${owner}/${repository}`;
+  logger.info("github.repository.fetch_started", {
+    service: "sentinel-github",
+    operationId,
+    repositoryIdentifier,
+    metadata: { operation: "repository_details" },
+  });
+
+  if (!isValidGitHubRepository(owner, repository)) {
+    logger.warn("github.repository.fetch_failed", {
+      service: "sentinel-github",
+      operationId,
+      repositoryIdentifier,
+      durationMs: Date.now() - startedAt,
+      metadata: { category: "invalid_repository_identifier" },
+    });
+    return { kind: "not-found" };
+  }
 
   const accessToken = await getGitHubAccessTokenForCurrentUser();
-  if (!accessToken) return { kind: "error", error: "Your GitHub authorization needs to be refreshed. Sign out, then connect GitHub again." };
+  if (!accessToken) {
+    logger.warn("github.repository.fetch_failed", {
+      service: "sentinel-github",
+      operationId,
+      repositoryIdentifier,
+      durationMs: Date.now() - startedAt,
+      metadata: { category: "authorization_missing" },
+    });
+    return { kind: "error", error: "Your GitHub authorization needs to be refreshed. Sign out, then connect GitHub again." };
+  }
 
   try {
     const repositoryResponse = await fetchGitHubApi(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}`, accessToken);
-    if (repositoryResponse.status === 404) return { kind: "not-found" };
+    if (repositoryResponse.status === 404) {
+      logger.warn("github.repository.fetch_failed", {
+        service: "sentinel-github",
+        operationId,
+        repositoryIdentifier,
+        durationMs: Date.now() - startedAt,
+        metadata: { category: "not_found" },
+      });
+      return { kind: "not-found" };
+    }
     if (!repositoryResponse.ok) throw new GitHubApiError(repositoryResponse.status);
 
     const repositoryDetails = parseRepositoryDetails(await repositoryResponse.json(), owner, repository);
     if (!repositoryDetails) throw new GitHubApiError(repositoryResponse.status);
 
+    logger.info("github.repository.fetch_succeeded", {
+      service: "sentinel-github",
+      operationId,
+      repositoryIdentifier,
+      durationMs: Date.now() - startedAt,
+      metadata: { operation: "repository_details" },
+    });
     return { kind: "ready", repository: repositoryDetails };
   } catch (error) {
+    logger.error("github.repository.fetch_failed", {
+      service: "sentinel-github",
+      operationId,
+      repositoryIdentifier,
+      durationMs: Date.now() - startedAt,
+      metadata: { category: getGitHubFailureCategory(error) },
+    });
     return { kind: "error", error: getUserFacingError(error) };
   }
 }
 
 /** Fetches the commit-pinned package manifest after repository access is verified. */
 export async function getGitHubPackageManifestForRepository(repository: GitHubRepositoryDetails): Promise<GitHubPackageManifestResult> {
-  if (!isVerifiedRepositoryDetails(repository)) return { kind: "not-found" };
+  const operationId = crypto.randomUUID();
+  const startedAt = Date.now();
+  const repositoryIdentifier = repository.fullName;
+  logger.info("github.package_json.fetch_started", {
+    service: "sentinel-github",
+    operationId,
+    repositoryIdentifier,
+    metadata: { operation: "package_manifest", outcome: "started" },
+  });
+
+  if (!isVerifiedRepositoryDetails(repository)) {
+    logger.warn("github.package_json.fetch_failed", {
+      service: "sentinel-github",
+      operationId,
+      repositoryIdentifier,
+      durationMs: Date.now() - startedAt,
+      metadata: { outcome: "failed", category: "invalid_verified_repository" },
+    });
+    return { kind: "not-found" };
+  }
 
   const accessToken = await getGitHubAccessTokenForCurrentUser();
-  if (!accessToken) return { kind: "error", error: "Your GitHub authorization needs to be refreshed. Sign out, then connect GitHub again." };
+  if (!accessToken) {
+    logger.warn("github.package_json.fetch_failed", {
+      service: "sentinel-github",
+      operationId,
+      repositoryIdentifier,
+      durationMs: Date.now() - startedAt,
+      metadata: { outcome: "failed", category: "authorization_missing" },
+    });
+    return { kind: "error", error: "Your GitHub authorization needs to be refreshed. Sign out, then connect GitHub again." };
+  }
 
   try {
     const repositoryDetails = { ...repository };
@@ -122,20 +202,72 @@ export async function getGitHubPackageManifestForRepository(repository: GitHubRe
     // Keep the content tied to the exact commit recorded for the scan. Reading
     // both from a moving branch concurrently could persist findings against a
     // different revision when a push lands between the two GitHub requests.
-    const baseCommitSha = await getDefaultBranchCommitSha(repositoryDetails.owner, repositoryDetails.name, repositoryDetails.defaultBranch, accessToken);
+    const baseCommitSha = await getDefaultBranchCommitSha(
+      repositoryDetails.owner,
+      repositoryDetails.name,
+      repositoryDetails.defaultBranch,
+      accessToken,
+      operationId,
+    );
     repositoryDetails.baseCommitSha = baseCommitSha;
 
     const packageJsonResponse = await fetchGitHubApi(`/repos/${encodeURIComponent(repositoryDetails.owner)}/${encodeURIComponent(repositoryDetails.name)}/contents/package.json?ref=${encodeURIComponent(baseCommitSha ?? repositoryDetails.defaultBranch)}`, accessToken);
 
-    if (packageJsonResponse.status === 404) return { kind: "no-package-json", repository: repositoryDetails };
+    if (packageJsonResponse.status === 404) {
+      logger.warn("github.package_json.fetch_failed", {
+        service: "sentinel-github",
+        operationId,
+        repositoryIdentifier,
+        durationMs: Date.now() - startedAt,
+        metadata: { outcome: "missing", category: "not_found" },
+      });
+      return { kind: "no-package-json", repository: repositoryDetails };
+    }
     if (!packageJsonResponse.ok) throw new GitHubApiError(packageJsonResponse.status);
 
     const packageJsonContent = parseContentResponse(await packageJsonResponse.json());
-    if (!packageJsonContent) return { kind: "no-package-json", repository: repositoryDetails };
+    if (!packageJsonContent) {
+      logger.warn("github.package_json.fetch_failed", {
+        service: "sentinel-github",
+        operationId,
+        repositoryIdentifier,
+        durationMs: Date.now() - startedAt,
+        metadata: { outcome: "invalid", category: "invalid_content_response" },
+      });
+      return { kind: "no-package-json", repository: repositoryDetails };
+    }
 
     const manifest = parsePackageManifest(packageJsonContent);
-    return manifest ? { kind: "ready", repository: repositoryDetails, manifest } : { kind: "invalid-package-json", repository: repositoryDetails };
+    if (!manifest) {
+      logger.warn("github.package_json.fetch_failed", {
+        service: "sentinel-github",
+        operationId,
+        repositoryIdentifier,
+        durationMs: Date.now() - startedAt,
+        metadata: { outcome: "invalid", category: "invalid_package_json" },
+      });
+      return { kind: "invalid-package-json", repository: repositoryDetails };
+    }
+
+    logger.info("github.package_json.fetch_succeeded", {
+      service: "sentinel-github",
+      operationId,
+      repositoryIdentifier,
+      durationMs: Date.now() - startedAt,
+      metadata: {
+        outcome: "ready",
+        commitPinned: baseCommitSha !== null,
+      },
+    });
+    return { kind: "ready", repository: repositoryDetails, manifest };
   } catch (error) {
+    logger.error("github.package_json.fetch_failed", {
+      service: "sentinel-github",
+      operationId,
+      repositoryIdentifier,
+      durationMs: Date.now() - startedAt,
+      metadata: { outcome: "failed", category: getGitHubFailureCategory(error) },
+    });
     return { kind: "error", error: getUserFacingError(error) };
   }
 }
@@ -165,16 +297,53 @@ function parseRepositoryDetails(value: unknown, requestedOwner: string, requeste
   return { githubRepositoryId: value.id, name, owner, fullName, visibility, defaultBranch: value.default_branch, language: typeof value.language === "string" && value.language.trim().length > 0 && value.language.length <= 100 ? value.language.trim() : null, githubUrl: value.html_url, baseCommitSha: null };
 }
 
-async function getDefaultBranchCommitSha(owner: string, repository: string, defaultBranch: string, accessToken: string) {
+async function getDefaultBranchCommitSha(
+  owner: string,
+  repository: string,
+  defaultBranch: string,
+  accessToken: string,
+  operationId: string,
+) {
+  const startedAt = Date.now();
+  const repositoryIdentifier = `${owner}/${repository}`;
   try {
     const response = await fetchGitHubApi(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/git/ref/heads/${encodeURIComponent(defaultBranch)}`, accessToken);
-    if (!response.ok) return null;
+    if (!response.ok) {
+      logger.warn("github.branch_sha.fetch_failed", {
+        service: "sentinel-github",
+        operationId,
+        repositoryIdentifier,
+        durationMs: Date.now() - startedAt,
+        metadata: {
+          outcome: "failed",
+          category: getGitHubFailureCategory(new GitHubApiError(response.status)),
+        },
+      });
+      return null;
+    }
 
     const value: unknown = await response.json();
-    return isRecord(value) && isRecord(value.object) && value.object.type === "commit" && typeof value.object.sha === "string" && /^[a-f\d]{40,64}$/i.test(value.object.sha)
+    const commitSha = isRecord(value) && isRecord(value.object) && value.object.type === "commit" && typeof value.object.sha === "string" && /^[a-f\d]{40,64}$/i.test(value.object.sha)
       ? value.object.sha
       : null;
-  } catch {
+    if (!commitSha) {
+      logger.warn("github.branch_sha.fetch_failed", {
+        service: "sentinel-github",
+        operationId,
+        repositoryIdentifier,
+        durationMs: Date.now() - startedAt,
+        metadata: { outcome: "failed", category: "invalid_response" },
+      });
+    }
+    return commitSha;
+  } catch (error) {
+    logger.warn("github.branch_sha.fetch_failed", {
+      service: "sentinel-github",
+      operationId,
+      repositoryIdentifier,
+      durationMs: Date.now() - startedAt,
+      metadata: { outcome: "failed", category: getGitHubFailureCategory(error) },
+    });
     return null;
   }
 }
@@ -250,4 +419,20 @@ function getUserFacingError(error: unknown) {
   }
 
   return "GitHub is unavailable right now. Please try again shortly.";
+}
+
+function getGitHubFailureCategory(error: unknown) {
+  if (error instanceof GitHubApiError) {
+    if (error.status === 401) return "authorization_rejected";
+    if (error.status === 403) return "access_forbidden";
+    if (error.status === 404) return "not_found";
+    if (error.status === 429) return "rate_limited";
+    if (error.status >= 500) return "provider_server_error";
+    if (error.status >= 200 && error.status < 300) return "invalid_response";
+    return "provider_http_error";
+  }
+  if (error instanceof DOMException && (error.name === "TimeoutError" || error.name === "AbortError")) {
+    return "timeout";
+  }
+  return "network_or_request_error";
 }

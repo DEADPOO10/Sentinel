@@ -2,6 +2,8 @@ import "server-only";
 
 import type { ProposedFix } from "@/lib/openai/proposed-fix";
 import { isDraftPrValidationEligible } from "@/lib/github/draft-pull-request-policy";
+import { logger } from "@/lib/logger";
+import { createOperationId, getOperationId, withOperationId } from "@/lib/observability/context";
 import { parseSignedWorkerResponse, readBoundedWorkerResponseText, verifiedWorkerPackageLockArtifact, workerResponseBindingFailure } from "@/lib/validation/worker-response";
 import type { VerifiedNpmPackageLockArtifact } from "@/lib/validation/npm-package-lock-artifact";
 import {
@@ -60,15 +62,36 @@ export type ProposedFixValidationExecution = {
  * OAuth tokens and any Sentinel application secret are never sent to it.
  */
 export async function validateProposedFixInTemporaryWorkspace(input: ValidationInput): Promise<ProposedFixValidationExecution> {
-  if (!isSafeGitCommitSha(input.baseCommitSha)) return execution(withBase(createUnableToValidateResult("The repository base commit could not be safely prepared for validation."), input));
+  const operationId = getOperationId() ?? createOperationId();
+  return withOperationId(
+    operationId,
+    () => validateProposedFixWithContext(input),
+  );
+}
+
+async function validateProposedFixWithContext(input: ValidationInput): Promise<ProposedFixValidationExecution> {
+  const startedAt = Date.now();
+  const jobId = createOperationId();
+  const logContext = (metadata: Record<string, unknown>) => ({
+    service: "sentinel-validation",
+    repositoryIdentifier: `${input.owner}/${input.repository}`,
+    durationMs: Date.now() - startedAt,
+    metadata: { jobId, ...metadata },
+  });
+
+  logger.info("validation.started", logContext({ stage: "preflight" }));
+
+  if (!isSafeGitCommitSha(input.baseCommitSha)) {
+    logger.warn("validation.rejected", logContext({ reason: "invalid_base_commit" }));
+    return execution(withBase(createUnableToValidateResult("The repository base commit could not be safely prepared for validation."), input));
+  }
 
   const configResult = getWorkerConfig();
   if (configResult.kind === "invalid") {
-    logSafeValidationEvent("config_invalid", { reason: configResult.reason });
+    logger.warn("validation.config_invalid", logContext({ reason: configResult.reason }));
     return execution(withBase(createUnableToValidateResult("Production validation is unavailable until a dedicated isolated validation worker is configured."), input));
   }
 
-  const jobId = crypto.randomUUID();
   const request: ValidationWorkerRequest = {
     version: 1,
     jobId,
@@ -82,7 +105,7 @@ export async function validateProposedFixInTemporaryWorkspace(input: ValidationI
     const result = await invokeValidationWorker(configResult.config, request);
     const bindingFailure = workerResponseBindingFailure(result, jobId, input.baseCommitSha);
     if (bindingFailure) {
-      logSafeValidationEvent("worker_response_rejected", { reason: bindingFailure });
+      logger.warn("validation.worker_response_rejected", logContext({ reason: bindingFailure }));
       return execution(withBase(createUnableToValidateResult("The isolated validation worker returned an invalid result."), input));
     }
     const artifact = verifiedWorkerPackageLockArtifact(result, {
@@ -91,16 +114,20 @@ export async function validateProposedFixInTemporaryWorkspace(input: ValidationI
       targetVersion: input.proposedFix.packageJsonChange.to,
     });
     if (artifact.kind === "invalid") throw new ValidationWorkerError("result_artifact_invalid", { field: artifact.reason });
+    logger.info("validation.completed", logContext({
+      overallStatus: result.overallStatus,
+      artifactStatus: artifact.kind,
+    }));
     return execution(
       withBase(normalizeWorkerResult(result), input),
       artifact.kind === "valid" ? artifact.artifact : null,
     );
   } catch (error) {
     const reason = error instanceof ValidationWorkerError ? error.reason : "request_failed";
-    logSafeValidationEvent("worker_request_failed", {
+    logger.error("validation.worker_request_failed", logContext({
       reason,
       ...(error instanceof ValidationWorkerError ? error.diagnostics : {}),
-    });
+    }));
     return execution(withBase(createUnableToValidateResult("The isolated validation worker could not complete this validation."), input));
   }
 }
@@ -221,4 +248,3 @@ class ValidationWorkerError extends Error {
     this.diagnostics = diagnostics;
   }
 }
-function logSafeValidationEvent(event: string, details: Record<string, string>) { console.error("[sentinel:validation-worker]", event, details); }

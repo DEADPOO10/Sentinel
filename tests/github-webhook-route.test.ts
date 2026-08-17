@@ -6,8 +6,9 @@ import {
   GITHUB_WEBHOOK_MAX_BODY_BYTES,
 } from "../lib/github/github-webhook-route.ts";
 import type { PullRequestLifecycleProcessingInput } from "../lib/db/pull-request-lifecycle.ts";
+import { hashLogIdentifier } from "../lib/logger.ts";
 
-const secret = "test-webhook-secret";
+const secret = "8d71f0ce950e4710b03f2b8c9e4d6a12726db7ec86124a32b17a3569b8fd4321";
 
 function payload(action = "ready_for_review") {
   return {
@@ -46,10 +47,11 @@ function request(body: string, overrides: {
 
 function handler(options: {
   configured?: boolean;
+  secret?: string;
   process?: (input: PullRequestLifecycleProcessingInput) => Promise<{ kind: "processed" }>;
 } = {}) {
   return createGitHubWebhookPostHandler({
-    getSecret: () => options.configured === false ? undefined : secret,
+    getSecret: () => options.configured === false ? undefined : options.secret ?? secret,
     processPullRequest: options.process ?? (async () => ({ kind: "processed" })),
   });
 }
@@ -64,6 +66,30 @@ test("a valid signed supported event is normalized and processed", async () => {
   assert.equal(response.headers.get("cache-control"), "no-store");
   assert.equal(received[0]?.deliveryId, "delivery-123");
   assert.equal(received[0]?.payload.pullRequest.status, "READY_FOR_REVIEW");
+});
+
+test("successful webhook logs share a safe operation ID and hashed repository identity", async () => {
+  const originalInfo = console.info;
+  const logs: unknown[][] = [];
+  console.info = (...values: unknown[]) => { logs.push(values); };
+  try {
+    const response = await handler()(request(JSON.stringify(payload())));
+    assert.equal(response.status, 200);
+    assert.equal(logs.length, 2);
+
+    const started = JSON.parse(logs[0][0] as string) as Record<string, unknown>;
+    const completed = JSON.parse(logs[1][0] as string) as Record<string, unknown>;
+    assert.equal(started.event, "github_webhook.started");
+    assert.equal(completed.event, "github_webhook.completed");
+    assert.match(started.operationId as string, /^[0-9a-f-]{36}$/i);
+    assert.equal(completed.operationId, started.operationId);
+    assert.equal((started.metadata as Record<string, unknown>).deliveryId, "delivery-123");
+    assert.equal((completed.metadata as Record<string, unknown>).deliveryId, "delivery-123");
+    assert.equal(completed.repositoryIdentifierHash, hashLogIdentifier("123456789", "repository"));
+    assert.equal(JSON.stringify(completed).includes("DEADPOO10/express"), false);
+  } finally {
+    console.info = originalInfo;
+  }
 });
 
 test("a correctly signed ping is accepted as a no-op", async () => {
@@ -112,6 +138,23 @@ test("a missing webhook secret fails closed", async () => {
   assert.equal(response.status, 503);
 });
 
+test("short and obvious placeholder webhook secrets fail closed", async () => {
+  const insecureSecrets = [
+    "too-short",
+    "example".repeat(5),
+    "changeme".repeat(4),
+    "test".repeat(8),
+    "secret".repeat(6),
+    "default".repeat(5),
+    "replace-with-a-random-webhook-secret",
+  ];
+
+  for (const insecureSecret of insecureSecrets) {
+    const response = await handler({ secret: insecureSecret })(request(JSON.stringify(payload())));
+    assert.equal(response.status, 503);
+  }
+});
+
 test("database failures return a retryable 500 without sensitive response details", async () => {
   const originalError = console.error;
   const logs: unknown[][] = [];
@@ -124,6 +167,20 @@ test("database failures return a retryable 500 without sensitive response detail
     const body = await response.text();
     assert.doesNotMatch(body, /DATABASE_URL|should-never-appear/);
     assert.equal(JSON.stringify(logs).includes("should-never-appear"), false);
+    assert.equal(logs.length, 1);
+    const record = JSON.parse(logs[0][0] as string) as Record<string, unknown>;
+    assert.equal(record.event, "github_webhook.completed");
+    assert.match(record.operationId as string, /^[0-9a-f-]{36}$/i);
+    assert.equal(record.repositoryIdentifierHash, hashLogIdentifier("123456789", "repository"));
+    assert.deepEqual(record.metadata, {
+      result: "processing_failed",
+      httpStatus: 500,
+      eventType: "pull_request",
+      deliveryId: "delivery-123",
+      action: "ready_for_review",
+      stage: "database_transaction",
+      category: "retryable_database_error",
+    });
   } finally {
     console.error = originalError;
   }
