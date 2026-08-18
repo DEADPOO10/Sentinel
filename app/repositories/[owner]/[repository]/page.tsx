@@ -59,7 +59,7 @@ export async function generateMetadata({
 export default async function RepositoryPackagePage({ params }: PageProps) {
   const { owner, repository } = await params;
   return (
-    <main className="min-h-screen bg-[#f5f5ef] text-[#171817]">
+    <main className="sentinel-page min-h-screen bg-[#f5f5ef] text-[#171817]">
       <Suspense fallback={<NavigationSkeleton />}>
         <SiteNavigation />
       </Suspense>

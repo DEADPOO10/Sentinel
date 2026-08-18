@@ -4,6 +4,7 @@ import {
   SignOutButton,
   SiteNavigationLinks,
 } from "@/components/auth-buttons";
+import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import { getCurrentUser } from "@/lib/auth/session";
 
@@ -42,6 +43,7 @@ export async function SiteNavigation() {
         {isAuthenticated ? (
           <div className="flex min-w-0 items-center gap-2 sm:gap-3">
             <SiteNavigationLinks authenticated />
+            <ThemeToggle />
 
             <div className="hidden items-center gap-2.5 border-l border-[#d5d6ce] pl-3 xl:flex">
               <span className="grid h-8 w-8 shrink-0 place-items-center border border-[#171817] bg-[#ecece5] font-mono text-xs font-medium text-[#171817]">
