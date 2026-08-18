@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+/* Sentinel controls the theme with the .dark class set by ThemeToggle. Keep
+ * Tailwind's dark: utilities aligned with that same source of truth instead
+ * of the operating system color-scheme preference. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme inline {
   --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-geist-mono), ui-monospace, monospace;
