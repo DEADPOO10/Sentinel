@@ -26,6 +26,14 @@ MAX_COMMAND_OUTPUT_BYTES = 24 * 1024
 REQUEST_MAX_AGE_SECONDS = 300
 CHECK_NAMES = ("typecheck", "lint", "test", "build")
 PACKAGE_MANAGERS = ("npm", "pnpm", "yarn")
+ASYNC_VALIDATION_PROTOCOL_VERSION = 1
+ASYNC_VALIDATION_FAILURE_CATEGORIES = (
+    "worker_unavailable",
+    "worker_timeout",
+    "result_invalid",
+    "job_expired",
+    "internal_error",
+)
 COMMIT_RE = re.compile(r"^[a-fA-F0-9]{40,64}$")
 UUID_RE = re.compile(r"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[1-5][a-fA-F0-9]{3}-[89ab][a-fA-F0-9]{3}-[a-fA-F0-9]{12}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
@@ -173,6 +181,122 @@ def parse_and_validate_job(value: Any) -> dict[str, Any]:
         if not isinstance(entries, list) or len(entries) > 8 or not all(_safe_text(item, 400) for item in entries):
             raise ValidationError("invalid_proposed_fix")
     return value
+
+
+def parse_async_submit_request(value: Any) -> dict[str, Any]:
+    """Validate the v2 submit envelope without changing the v1 job contract."""
+    if not isinstance(value, dict) or set(value) != {"version", "operation", "validation"}:
+        raise ValidationError("invalid_async_submit")
+    if value["version"] != ASYNC_VALIDATION_PROTOCOL_VERSION or value["operation"] != "submit":
+        raise ValidationError("invalid_async_submit")
+    return parse_and_validate_job(value["validation"])
+
+
+def parse_async_status_request(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"version", "operation", "jobId", "repository"}:
+        raise ValidationError("invalid_async_status")
+    repository = value.get("repository")
+    if (
+        value.get("version") != ASYNC_VALIDATION_PROTOCOL_VERSION
+        or value.get("operation") != "status"
+        or not isinstance(value.get("jobId"), str)
+        or not UUID_RE.fullmatch(value["jobId"])
+        or not isinstance(repository, dict)
+        or set(repository) != {"commitSha"}
+        or not isinstance(repository.get("commitSha"), str)
+        or not COMMIT_RE.fullmatch(repository["commitSha"])
+    ):
+        raise ValidationError("invalid_async_status")
+    return value
+
+
+def validate_worker_result(value: Any, job_id: str, commit_sha: str) -> dict[str, Any]:
+    """Validate a bounded final v1 result before durable async storage."""
+    if not isinstance(value, dict):
+        raise ValidationError("result_invalid")
+    required = {"version", "jobId", "repository", "overallStatus", "install", "checks", "warnings", "partialReasons"}
+    if frozenset(value) not in {frozenset(required), frozenset(required | {"artifact"})}:
+        raise ValidationError("result_invalid")
+    repository = value.get("repository")
+    if (
+        value.get("version") != 1
+        or value.get("jobId") != job_id
+        or not isinstance(repository, dict)
+        or set(repository) != {"commitSha"}
+        or not isinstance(repository.get("commitSha"), str)
+        or repository["commitSha"].lower() != commit_sha.lower()
+        or value.get("overallStatus") not in {"passed", "failed", "partial", "unable_to_validate"}
+    ):
+        raise ValidationError("result_invalid")
+    install = value.get("install")
+    if (
+        not isinstance(install, dict)
+        or set(install) != {"status", "summary"}
+        or install.get("status") not in {"passed", "failed", "skipped"}
+        or not _safe_text(install.get("summary"), 1000)
+    ):
+        raise ValidationError("result_invalid")
+    checks = value.get("checks")
+    if not isinstance(checks, list) or len(checks) != len(CHECK_NAMES):
+        raise ValidationError("result_invalid")
+    seen: set[str] = set()
+    for check in checks:
+        if (
+            not isinstance(check, dict)
+            or set(check) != {"name", "status", "durationMs", "summary"}
+            or check.get("name") not in CHECK_NAMES
+            or check["name"] in seen
+            or check.get("status") not in {"passed", "failed", "skipped", "timed_out"}
+            or not isinstance(check.get("durationMs"), int)
+            or isinstance(check.get("durationMs"), bool)
+            or not 0 <= check["durationMs"] <= 300000
+            or not _safe_text(check.get("summary"), 1000)
+        ):
+            raise ValidationError("result_invalid")
+        seen.add(check["name"])
+    if seen != set(CHECK_NAMES):
+        raise ValidationError("result_invalid")
+    warnings = value.get("warnings")
+    partial_reasons = value.get("partialReasons")
+    if not isinstance(warnings, list) or len(warnings) > 12 or not all(_safe_text(item, 1000) for item in warnings):
+        raise ValidationError("result_invalid")
+    allowed_partial_reasons = {"skipped_checks", "no_lockfile_fallback", "cleanup_unconfirmed", "validation_timeout"}
+    if (
+        not isinstance(partial_reasons, list)
+        or len(partial_reasons) > len(allowed_partial_reasons)
+        or not all(isinstance(item, str) and item in allowed_partial_reasons for item in partial_reasons)
+    ):
+        raise ValidationError("result_invalid")
+    if "artifact" in value:
+        _validate_npm_lockfile_artifact(value["artifact"])
+    if len(canonical_json(value)) > MAX_RESPONSE_BYTES:
+        raise ValidationError("result_invalid")
+    return value
+
+
+def _validate_npm_lockfile_artifact(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {"kind", "path", "encoding", "content", "byteLength", "sha256"}:
+        raise ValidationError("result_invalid")
+    if value.get("kind") != "npm_package_lock" or value.get("path") != "package-lock.json" or value.get("encoding") != "base64":
+        raise ValidationError("result_invalid")
+    content = value.get("content")
+    byte_length = value.get("byteLength")
+    digest = value.get("sha256")
+    if (
+        not isinstance(content, str)
+        or not isinstance(byte_length, int)
+        or isinstance(byte_length, bool)
+        or not 0 < byte_length <= 2 * 1024 * 1024
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", digest)
+    ):
+        raise ValidationError("result_invalid")
+    try:
+        decoded = base64.b64decode(content, validate=True)
+    except (ValueError, TypeError) as error:
+        raise ValidationError("result_invalid") from error
+    if len(decoded) != byte_length or hashlib.sha256(decoded).hexdigest() != digest:
+        raise ValidationError("result_invalid")
 
 
 def result_for_error(job: Mapping[str, Any] | None, summary: str, warning: str) -> dict[str, Any]:

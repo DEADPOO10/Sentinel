@@ -7,7 +7,7 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 
-from worker.core import POLICY, ValidationError, inspect_github_zip, parse_and_validate_job, request_auth_failure_reason, request_signed_message, sign, sign_request, verify_request_signature, verify_signature, verify_timestamp
+from worker.core import POLICY, ValidationError, inspect_github_zip, parse_and_validate_job, parse_async_status_request, parse_async_submit_request, request_auth_failure_reason, request_signed_message, sign, sign_request, validate_worker_result, verify_request_signature, verify_signature, verify_timestamp
 
 
 def job():
@@ -93,6 +93,41 @@ console.log(signValidationWorkerRequest(secret, timestamp, Buffer.from(encodedPa
             archive.writestr(entry, "target")
         with self.assertRaises(ValidationError):
             inspect_github_zip(unsafe.getvalue())
+
+    def test_async_submit_and_status_contracts_are_exact_and_versioned(self):
+        submit = {"version": 1, "operation": "submit", "validation": job()}
+        status = {
+            "version": 1,
+            "operation": "status",
+            "jobId": job()["jobId"],
+            "repository": {"commitSha": job()["repository"]["commitSha"]},
+        }
+        self.assertEqual(parse_async_submit_request(submit), job())
+        self.assertEqual(parse_async_status_request(status), status)
+        with self.assertRaises(ValidationError):
+            parse_async_submit_request({**submit, "unexpected": True})
+        with self.assertRaises(ValidationError):
+            parse_async_status_request({**status, "version": 2})
+
+    def test_async_completed_result_is_strictly_job_and_commit_bound(self):
+        value = {
+            "version": 1,
+            "jobId": job()["jobId"],
+            "repository": {"commitSha": job()["repository"]["commitSha"]},
+            "overallStatus": "passed",
+            "install": {"status": "passed", "summary": "Completed."},
+            "checks": [
+                {"name": name, "status": "passed", "durationMs": 1, "summary": "Completed."}
+                for name in ("typecheck", "lint", "test", "build")
+            ],
+            "warnings": [],
+            "partialReasons": [],
+        }
+        self.assertEqual(validate_worker_result(value, job()["jobId"], job()["repository"]["commitSha"]), value)
+        with self.assertRaises(ValidationError):
+            validate_worker_result({**value, "jobId": "00000000-0000-4000-8000-000000000000"}, job()["jobId"], job()["repository"]["commitSha"])
+        with self.assertRaises(ValidationError):
+            validate_worker_result({**value, "repository": {"commitSha": "b" * 40}}, job()["jobId"], job()["repository"]["commitSha"])
 
 
 if __name__ == "__main__":

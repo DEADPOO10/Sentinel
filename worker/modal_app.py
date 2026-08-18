@@ -19,7 +19,27 @@ from typing import Any, Awaitable, Callable, Literal
 import modal
 from fastapi import Request
 
-from worker.core import CHECK_NAMES, MAX_ARCHIVE_COMPRESSED_BYTES, MAX_COMMAND_OUTPUT_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, POLICY, ValidationError, canonical_json, inspect_github_zip, parse_and_validate_job, request_auth_failure_reason, result_for_error, sign, verify_signature
+from worker.core import (
+    ASYNC_VALIDATION_FAILURE_CATEGORIES,
+    ASYNC_VALIDATION_PROTOCOL_VERSION,
+    CHECK_NAMES,
+    MAX_ARCHIVE_COMPRESSED_BYTES,
+    MAX_COMMAND_OUTPUT_BYTES,
+    MAX_REQUEST_BYTES,
+    MAX_RESPONSE_BYTES,
+    POLICY,
+    ValidationError,
+    canonical_json,
+    inspect_github_zip,
+    parse_and_validate_job,
+    parse_async_status_request,
+    parse_async_submit_request,
+    request_auth_failure_reason,
+    result_for_error,
+    sign,
+    validate_worker_result,
+    verify_signature,
+)
 
 APP_NAME = "sentinel-validation-worker"
 SECRET_NAME = "sentinel-validation-worker"
@@ -65,8 +85,21 @@ REQUEST_REPLAY_CACHE = modal.Dict.from_name(
     "sentinel-validation-request-replay-v1",
     create_if_missing=True,
 )
-SignatureScheme = Literal["v1", "legacy"]
+# Modal 1.5.3 stores named Dict entries durably across containers and expires
+# each entry after seven days without a read or write. Values here are strict,
+# bounded state/result records; execution claims contain only job/commit IDs.
+ASYNC_VALIDATION_JOB_STATE = modal.Dict.from_name(
+    "sentinel-validation-jobs-v2",
+    create_if_missing=True,
+)
+SignatureScheme = Literal["v1", "legacy", "v2_submit", "v2_status"]
 ReplayReserver = Callable[[SignatureScheme, str], Awaitable[bool]]
+AsyncJobReserver = Callable[[dict[str, Any]], Awaitable[bool]]
+AsyncJobReader = Callable[[str], Awaitable[dict[str, Any] | None]]
+AsyncJobWriter = Callable[[dict[str, Any]], Awaitable[None]]
+AsyncJobSpawner = Callable[[dict[str, Any]], Awaitable[None]]
+AsyncExecutionClaimReserver = Callable[[dict[str, Any]], Awaitable[bool]]
+AsyncJobExecutor = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 LEGACY_SIGNATURE_COMPATIBILITY_ENV = "SENTINEL_VALIDATION_ACCEPT_LEGACY_SIGNATURES"
 
 TRUSTED_SANDBOX_AGENT_PATH = Path("/opt/sentinel/worker/sandbox_agent.py")
@@ -101,6 +134,7 @@ COMMAND_OUTPUT_TAIL_BYTES = MAX_COMMAND_OUTPUT_BYTES - COMMAND_OUTPUT_HEAD_BYTES
 # reserve so termination, result signing, and response delivery are not
 # competing with an in-flight repository command at that deadline.
 TOTAL_VALIDATION_DURATION_SECONDS = 300
+ASYNC_BACKGROUND_FUNCTION_TIMEOUT_SECONDS = 330
 CLEANUP_RESERVE_SECONDS = 20
 VALIDATION_EXECUTION_BUDGET_SECONDS = TOTAL_VALIDATION_DURATION_SECONDS - CLEANUP_RESERVE_SECONDS
 SETUP_COMMAND_TIMEOUT_SECONDS = 90
@@ -127,12 +161,22 @@ SAFE_SANDBOX_FAILURE_STAGES = frozenset(
 )
 
 
-def create_api(replay_reserver: ReplayReserver | None = None):
+def create_api(
+    replay_reserver: ReplayReserver | None = None,
+    async_job_reserver: AsyncJobReserver | None = None,
+    async_job_reader: AsyncJobReader | None = None,
+    async_job_writer: AsyncJobWriter | None = None,
+    async_job_spawner: AsyncJobSpawner | None = None,
+):
     from fastapi import FastAPI
     from fastapi.responses import Response
 
     api = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     reserve_replay = replay_reserver or reserve_validation_request
+    reserve_async_job = async_job_reserver or reserve_async_validation_job
+    read_async_job = async_job_reader or read_async_validation_job
+    write_async_job = async_job_writer or write_async_validation_job
+    spawn_async_job = async_job_spawner or spawn_async_validation_job
 
     @api.post("/v1/validations")
     async def validate(request: Request) -> Response:
@@ -191,6 +235,103 @@ def create_api(replay_reserver: ReplayReserver | None = None):
             log_sandbox_failure("sandbox_result_invalid")
             return signed_json(secret, result_for_error(job, "The isolated validation worker could not complete this validation.", "worker_failure"), 200)
 
+    @api.post("/v2/validations/submit")
+    async def submit_validation(request: Request) -> Response:
+        raw = await request.body()
+        secret = os.environ.get("SENTINEL_VALIDATION_WORKER_SHARED_SECRET", "")
+        if not secret or len(secret) < 32:
+            return signed_async_failure(secret, None, None, "worker_unavailable", 503)
+        if len(raw) > MAX_REQUEST_BYTES:
+            log_request_auth_failure("request_too_large")
+            return signed_async_failure(secret, None, None, "result_invalid", 401)
+        request_signature = request.headers.get("x-sentinel-request-signature")
+        request_timestamp = request.headers.get("x-sentinel-request-timestamp")
+        auth_failure = request_auth_failure_reason(secret, raw, request_signature, request_timestamp)
+        if auth_failure:
+            log_request_auth_failure(auth_failure)
+            return signed_async_failure(secret, None, None, "result_invalid", 401)
+        if request_signature is None:
+            log_request_auth_failure("missing_headers")
+            return signed_async_failure(secret, None, None, "result_invalid", 401)
+        try:
+            replay_reserved = await reserve_replay("v2_submit", request_signature)
+        except Exception:
+            log_request_auth_failure("replay_store_unavailable")
+            return signed_async_failure(secret, None, None, "worker_unavailable", 503)
+        if not replay_reserved:
+            log_request_auth_failure("replay_detected")
+            return signed_async_failure(secret, None, None, "result_invalid", 401)
+        try:
+            job = parse_async_submit_request(json.loads(raw))
+        except (ValidationError, json.JSONDecodeError):
+            return signed_async_failure(secret, None, None, "result_invalid", 422)
+
+        try:
+            reserved = await reserve_async_job(job)
+            if reserved:
+                try:
+                    await spawn_async_job(job)
+                except Exception:
+                    failed = failed_async_job_state(job, "worker_unavailable")
+                    await write_async_job(failed)
+                    log_async_job_failure("worker_unavailable")
+                    return signed_json(secret, async_status_payload(failed), 503)
+            else:
+                existing = await read_async_job(job["jobId"])
+                if not valid_async_job_state(existing) or existing["repository"]["commitSha"].lower() != job["repository"]["commitSha"].lower():
+                    return signed_async_failure(secret, job["jobId"], job["repository"]["commitSha"], "result_invalid", 409)
+        except Exception:
+            log_async_job_failure("worker_unavailable")
+            return signed_async_failure(secret, job["jobId"], job["repository"]["commitSha"], "worker_unavailable", 503)
+
+        return signed_json(secret, async_submit_receipt(job), 202)
+
+    @api.post("/v2/validations/status")
+    async def validation_status(request: Request) -> Response:
+        raw = await request.body()
+        secret = os.environ.get("SENTINEL_VALIDATION_WORKER_SHARED_SECRET", "")
+        if not secret or len(secret) < 32:
+            return signed_async_failure(secret, None, None, "worker_unavailable", 503)
+        if len(raw) > MAX_REQUEST_BYTES:
+            log_request_auth_failure("request_too_large")
+            return signed_async_failure(secret, None, None, "result_invalid", 401)
+        request_signature = request.headers.get("x-sentinel-request-signature")
+        request_timestamp = request.headers.get("x-sentinel-request-timestamp")
+        auth_failure = request_auth_failure_reason(secret, raw, request_signature, request_timestamp)
+        if auth_failure:
+            log_request_auth_failure(auth_failure)
+            return signed_async_failure(secret, None, None, "result_invalid", 401)
+        if request_signature is None:
+            log_request_auth_failure("missing_headers")
+            return signed_async_failure(secret, None, None, "result_invalid", 401)
+        try:
+            replay_reserved = await reserve_replay("v2_status", request_signature)
+        except Exception:
+            log_request_auth_failure("replay_store_unavailable")
+            return signed_async_failure(secret, None, None, "worker_unavailable", 503)
+        if not replay_reserved:
+            log_request_auth_failure("replay_detected")
+            return signed_async_failure(secret, None, None, "result_invalid", 401)
+        try:
+            status_request = parse_async_status_request(json.loads(raw))
+        except (ValidationError, json.JSONDecodeError):
+            return signed_async_failure(secret, None, None, "result_invalid", 422)
+
+        job_id = status_request["jobId"]
+        commit_sha = status_request["repository"]["commitSha"]
+        try:
+            state = await read_async_job(job_id)
+        except Exception:
+            log_async_job_failure("worker_unavailable")
+            return signed_async_failure(secret, job_id, commit_sha, "worker_unavailable", 503)
+        if state is None:
+            return signed_async_failure(secret, job_id, commit_sha, "job_expired", 404)
+        if not valid_async_job_state(state):
+            return signed_async_failure(secret, job_id, commit_sha, "result_invalid", 500)
+        if state["repository"]["commitSha"].lower() != commit_sha.lower():
+            return signed_async_failure(secret, job_id, commit_sha, "result_invalid", 404)
+        return signed_json(secret, async_status_payload(state), 200)
+
     return api
 
 
@@ -211,6 +352,281 @@ def create_api(replay_reserver: ReplayReserver | None = None):
 @modal.asgi_app()
 def web():
     return create_api()
+
+
+@app.function(
+    image=WORKER_IMAGE,
+    secrets=[modal.Secret.from_name(SECRET_NAME)],
+    timeout=ASYNC_BACKGROUND_FUNCTION_TIMEOUT_SECONDS,
+    retries=0,
+    cpu=(1.0, 1.0),
+    memory=(2048, 2048),
+    max_containers=2,
+)
+async def execute_async_validation_background(job: dict[str, Any]) -> None:
+    await run_async_validation_background(job)
+
+
+async def run_async_validation_background(
+    job: dict[str, Any],
+    *,
+    claim_reserver: AsyncExecutionClaimReserver | None = None,
+    job_reader: AsyncJobReader | None = None,
+    job_writer: AsyncJobWriter | None = None,
+    executor: AsyncJobExecutor | None = None,
+) -> None:
+    """Claim and execute one accepted job; duplicate invocations are no-ops."""
+    parsed_job = parse_and_validate_job(job)
+    reserve_claim = claim_reserver or reserve_async_execution_claim
+    read_job = job_reader or read_async_validation_job
+    write_job = job_writer or write_async_validation_job
+    execute = executor or execute_job
+
+    if not await reserve_claim(parsed_job):
+        return
+    state = await read_job(parsed_job["jobId"])
+    if (
+        not valid_async_job_state(state)
+        or state["repository"]["commitSha"].lower() != parsed_job["repository"]["commitSha"].lower()
+        or state["status"] != "queued"
+    ):
+        return
+
+    running = running_async_job_state(state)
+    await write_job(running)
+    try:
+        result = await asyncio.wait_for(execute(parsed_job), timeout=TOTAL_VALIDATION_DURATION_SECONDS)
+    except (asyncio.TimeoutError, TimeoutError):
+        log_async_job_failure("worker_timeout")
+        await write_job(failed_async_job_state(parsed_job, "worker_timeout", running))
+        return
+    except ValidationError as error:
+        reason = error.args[0] if error.args and isinstance(error.args[0], str) else "worker_failure"
+        result = result_for_error(
+            parsed_job,
+            "The isolated validation worker could not safely complete this validation.",
+            reason,
+        )
+    except Exception:
+        log_async_job_failure("internal_error")
+        await write_job(failed_async_job_state(parsed_job, "internal_error", running))
+        return
+
+    try:
+        validated_result = validate_worker_result(
+            result,
+            parsed_job["jobId"],
+            parsed_job["repository"]["commitSha"],
+        )
+    except ValidationError:
+        log_async_job_failure("result_invalid")
+        await write_job(failed_async_job_state(parsed_job, "result_invalid", running))
+        return
+    await write_job(completed_async_job_state(running, validated_result))
+
+
+async def spawn_async_validation_job(job: dict[str, Any]) -> None:
+    # Modal 1.5.3's async spawn returns after durable function-call submission.
+    await execute_async_validation_background.spawn.aio(job)
+
+
+def async_job_state_key(job_id: str) -> str:
+    return f"job:{job_id}"
+
+
+def async_execution_claim_key(job_id: str) -> str:
+    return f"execution:{job_id}"
+
+
+def current_timestamp_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def queued_async_job_state(job: dict[str, Any], *, timestamp_ms: int | None = None) -> dict[str, Any]:
+    timestamp = timestamp_ms if timestamp_ms is not None else current_timestamp_ms()
+    return {
+        "version": ASYNC_VALIDATION_PROTOCOL_VERSION,
+        "jobId": job["jobId"],
+        "repository": {"commitSha": job["repository"]["commitSha"]},
+        "status": "queued",
+        "queuedAt": timestamp,
+        "updatedAt": timestamp,
+    }
+
+
+def running_async_job_state(state: dict[str, Any], *, timestamp_ms: int | None = None) -> dict[str, Any]:
+    timestamp = timestamp_ms if timestamp_ms is not None else current_timestamp_ms()
+    return {
+        "version": ASYNC_VALIDATION_PROTOCOL_VERSION,
+        "jobId": state["jobId"],
+        "repository": {"commitSha": state["repository"]["commitSha"]},
+        "status": "running",
+        "queuedAt": state["queuedAt"],
+        "startedAt": timestamp,
+        "updatedAt": timestamp,
+    }
+
+
+def completed_async_job_state(
+    state: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    timestamp_ms: int | None = None,
+) -> dict[str, Any]:
+    timestamp = timestamp_ms if timestamp_ms is not None else current_timestamp_ms()
+    return {
+        "version": ASYNC_VALIDATION_PROTOCOL_VERSION,
+        "jobId": state["jobId"],
+        "repository": {"commitSha": state["repository"]["commitSha"]},
+        "status": "completed",
+        "queuedAt": state["queuedAt"],
+        "startedAt": state["startedAt"],
+        "completedAt": timestamp,
+        "updatedAt": timestamp,
+        "result": result,
+    }
+
+
+def failed_async_job_state(
+    job: dict[str, Any],
+    failure_category: str,
+    previous: dict[str, Any] | None = None,
+    *,
+    timestamp_ms: int | None = None,
+) -> dict[str, Any]:
+    if failure_category not in ASYNC_VALIDATION_FAILURE_CATEGORIES:
+        failure_category = "internal_error"
+    timestamp = timestamp_ms if timestamp_ms is not None else current_timestamp_ms()
+    state = {
+        "version": ASYNC_VALIDATION_PROTOCOL_VERSION,
+        "jobId": job["jobId"],
+        "repository": {"commitSha": job["repository"]["commitSha"]},
+        "status": "failed",
+        "queuedAt": previous["queuedAt"] if previous else timestamp,
+        "completedAt": timestamp,
+        "updatedAt": timestamp,
+        "failureCategory": failure_category,
+    }
+    if previous and isinstance(previous.get("startedAt"), int):
+        state["startedAt"] = previous["startedAt"]
+    return state
+
+
+def valid_async_job_state(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    base = {"version", "jobId", "repository", "status", "queuedAt", "updatedAt"}
+    status = value.get("status")
+    allowed_keys = {
+        "queued": {frozenset(base)},
+        "running": {frozenset(base | {"startedAt"})},
+        "completed": {frozenset(base | {"startedAt", "completedAt", "result"})},
+        "failed": {
+            frozenset(base | {"completedAt", "failureCategory"}),
+            frozenset(base | {"startedAt", "completedAt", "failureCategory"}),
+        },
+    }
+    if not isinstance(status, str) or status not in allowed_keys or frozenset(value) not in allowed_keys[status]:
+        return False
+    if (
+        value.get("version") != ASYNC_VALIDATION_PROTOCOL_VERSION
+        or not isinstance(value.get("jobId"), str)
+        or not re.fullmatch(r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[1-5][a-fA-F0-9]{3}-[89ab][a-fA-F0-9]{3}-[a-fA-F0-9]{12}", value["jobId"])
+        or not isinstance(value.get("repository"), dict)
+        or set(value["repository"]) != {"commitSha"}
+        or not isinstance(value["repository"].get("commitSha"), str)
+        or not re.fullmatch(r"[a-fA-F0-9]{40,64}", value["repository"]["commitSha"])
+    ):
+        return False
+    timestamps = [value.get("queuedAt"), value.get("updatedAt")]
+    timestamps.extend(value[field] for field in ("startedAt", "completedAt") if field in value)
+    if not all(isinstance(item, int) and not isinstance(item, bool) and item > 0 for item in timestamps):
+        return False
+    if status == "failed" and value.get("failureCategory") not in ASYNC_VALIDATION_FAILURE_CATEGORIES:
+        return False
+    if status == "completed":
+        try:
+            validate_worker_result(value.get("result"), value["jobId"], value["repository"]["commitSha"])
+        except ValidationError:
+            return False
+    return True
+
+
+async def reserve_async_validation_job(job: dict[str, Any]) -> bool:
+    parsed = parse_and_validate_job(job)
+    return await ASYNC_VALIDATION_JOB_STATE.put.aio(
+        async_job_state_key(parsed["jobId"]),
+        queued_async_job_state(parsed),
+        skip_if_exists=True,
+    )
+
+
+async def read_async_validation_job(job_id: str) -> dict[str, Any] | None:
+    return await ASYNC_VALIDATION_JOB_STATE.get.aio(async_job_state_key(job_id), None)
+
+
+async def write_async_validation_job(state: dict[str, Any]) -> None:
+    if not valid_async_job_state(state):
+        raise ValidationError("result_invalid")
+    await ASYNC_VALIDATION_JOB_STATE.put.aio(async_job_state_key(state["jobId"]), state)
+
+
+async def reserve_async_execution_claim(job: dict[str, Any]) -> bool:
+    parsed = parse_and_validate_job(job)
+    return await ASYNC_VALIDATION_JOB_STATE.put.aio(
+        async_execution_claim_key(parsed["jobId"]),
+        {
+            "jobId": parsed["jobId"],
+            "repository": {"commitSha": parsed["repository"]["commitSha"]},
+            "claimedAt": current_timestamp_ms(),
+        },
+        skip_if_exists=True,
+    )
+
+
+def async_submit_receipt(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "version": ASYNC_VALIDATION_PROTOCOL_VERSION,
+        "jobId": job["jobId"],
+        "repository": {"commitSha": job["repository"]["commitSha"]},
+        "status": "queued",
+    }
+
+
+def async_status_payload(state: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "version": ASYNC_VALIDATION_PROTOCOL_VERSION,
+        "jobId": state["jobId"],
+        "repository": {"commitSha": state["repository"]["commitSha"]},
+        "status": state["status"],
+    }
+    if state["status"] == "completed":
+        payload["result"] = state["result"]
+    elif state["status"] == "failed":
+        payload["failureCategory"] = state["failureCategory"]
+    return payload
+
+
+def signed_async_failure(
+    secret: str,
+    job_id: str | None,
+    commit_sha: str | None,
+    failure_category: str,
+    status: int,
+):
+    if failure_category not in ASYNC_VALIDATION_FAILURE_CATEGORIES:
+        failure_category = "internal_error"
+    return signed_json(
+        secret,
+        {
+            "version": ASYNC_VALIDATION_PROTOCOL_VERSION,
+            "jobId": job_id or "00000000-0000-4000-8000-000000000000",
+            "repository": {"commitSha": commit_sha or "0" * 40},
+            "status": "failed",
+            "failureCategory": failure_category,
+        },
+        status,
+    )
 
 
 async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -792,7 +1208,7 @@ def legacy_signature_compatibility_enabled() -> bool:
 
 def replay_cache_key(signature_scheme: SignatureScheme, signature: str) -> str:
     """Return a domain-separated digest without retaining the signature."""
-    if signature_scheme not in {"v1", "legacy"}:
+    if signature_scheme not in {"v1", "legacy", "v2_submit", "v2_status"}:
         raise ValueError("unsupported_signature_scheme")
     material = b"sentinel-validation-replay\x00" + signature_scheme.encode("ascii") + b"\x00" + signature.encode("ascii")
     return hashlib.sha256(material).hexdigest()
@@ -815,6 +1231,12 @@ def log_request_auth_failure(reason: str) -> None:
 def log_legacy_signature_accepted() -> None:
     # Fixed event only: never log the compatibility flag, signature, or body.
     logger.warning("[sentinel:validation-worker] legacy_signature_accepted")
+
+
+def log_async_job_failure(category: str) -> None:
+    if category not in ASYNC_VALIDATION_FAILURE_CATEGORIES:
+        category = "internal_error"
+    logger.warning("[sentinel:validation-worker] async_job_failed category=%s", category)
 
 
 def log_sandbox_failure(stage: str) -> None:

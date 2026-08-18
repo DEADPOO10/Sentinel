@@ -1,3 +1,4 @@
+import asyncio
 import json
 import hashlib
 import os
@@ -11,7 +12,41 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from worker.core import CHECK_NAMES, MAX_COMMAND_OUTPUT_BYTES, POLICY, ValidationError, canonical_json, sign, sign_request, verify_signature
-from worker.modal_app import CHECK_TIMEOUT_SECONDS, CLEANUP_RESERVE_SECONDS, LEGACY_SIGNATURE_COMPATIBILITY_ENV, MAX_NPM_PACKAGE_LOCK_ARTIFACT_BYTES, MAX_RESULT_SUMMARY_CHARS, SANDBOX_AGENT_REMOTE_PATH, SANDBOX_USER_PREFIX, TOTAL_VALIDATION_DURATION_SECONDS, TRUNCATED_OUTPUT_NOTICE, VALIDATION_EXECUTION_BUDGET_SECONDS, cleanup_sandbox, command_summary, command_timeout_seconds, create_api, create_npm_package_lock_artifact, execute_job, install_argv, legacy_signature_compatibility_enabled, normalize_command_output, npm_lockfile_sync_argv, read_bounded_output, replay_cache_key, reserve_validation_request, run_validation_checks, trusted_sandbox_agent_path
+from worker.modal_app import (
+    CHECK_TIMEOUT_SECONDS,
+    CLEANUP_RESERVE_SECONDS,
+    LEGACY_SIGNATURE_COMPATIBILITY_ENV,
+    MAX_NPM_PACKAGE_LOCK_ARTIFACT_BYTES,
+    MAX_RESULT_SUMMARY_CHARS,
+    SANDBOX_AGENT_REMOTE_PATH,
+    SANDBOX_USER_PREFIX,
+    TOTAL_VALIDATION_DURATION_SECONDS,
+    TRUNCATED_OUTPUT_NOTICE,
+    VALIDATION_EXECUTION_BUDGET_SECONDS,
+    async_status_payload,
+    cleanup_sandbox,
+    command_summary,
+    command_timeout_seconds,
+    completed_async_job_state,
+    create_api,
+    create_npm_package_lock_artifact,
+    execute_job,
+    install_argv,
+    legacy_signature_compatibility_enabled,
+    normalize_command_output,
+    npm_lockfile_sync_argv,
+    queued_async_job_state,
+    read_bounded_output,
+    replay_cache_key,
+    reserve_async_execution_claim,
+    reserve_async_validation_job,
+    reserve_validation_request,
+    run_async_validation_background,
+    run_validation_checks,
+    spawn_async_validation_job,
+    trusted_sandbox_agent_path,
+    valid_async_job_state,
+)
 
 
 def valid_job():
@@ -47,6 +82,31 @@ def successful_result():
         ],
         "warnings": [],
         "partialReasons": [],
+    }
+
+
+def async_submit_body():
+    return canonical_json({"version": 1, "operation": "submit", "validation": valid_job()})
+
+
+def async_status_body(*, commit_sha=None):
+    job = valid_job()
+    return canonical_json(
+        {
+            "version": 1,
+            "operation": "status",
+            "jobId": job["jobId"],
+            "repository": {"commitSha": commit_sha or job["repository"]["commitSha"]},
+        }
+    )
+
+
+def signed_headers(secret, body, *, timestamp=None, legacy=False):
+    request_timestamp = timestamp or str(int(time.time() * 1000))
+    return {
+        "content-type": "application/json",
+        "x-sentinel-request-signature": sign(secret, body) if legacy else sign_request(secret, request_timestamp, body),
+        "x-sentinel-request-timestamp": request_timestamp,
     }
 
 
@@ -150,6 +210,37 @@ class FakeSandbox:
         self._experimental_set_outbound_network_policy = AioOnlyCall()
         self.terminate = AioOnlyCall()
         self.detach = AioOnlyCall()
+
+
+class FakeAsyncJobStore:
+    def __init__(self):
+        self.states = {}
+        self.claims = set()
+        self.writes = []
+        self.reserve_calls = 0
+
+    async def reserve(self, job):
+        self.reserve_calls += 1
+        if job["jobId"] in self.states:
+            return False
+        state = queued_async_job_state(job, timestamp_ms=1_786_896_000_000)
+        self.states[job["jobId"]] = state
+        return True
+
+    async def read(self, job_id):
+        return self.states.get(job_id)
+
+    async def write(self, state):
+        if not valid_async_job_state(state):
+            raise AssertionError("invalid async state")
+        self.states[state["jobId"]] = state
+        self.writes.append(state)
+
+    async def claim(self, job):
+        if job["jobId"] in self.claims:
+            return False
+        self.claims.add(job["jobId"])
+        return True
 
 
 class ModalAppTests(unittest.TestCase):
@@ -492,12 +583,14 @@ class ModalAsyncExecutionTests(unittest.IsolatedAsyncioTestCase):
         signature = "a" * 43
         v1_key = replay_cache_key("v1", signature)
         legacy_key = replay_cache_key("legacy", signature)
+        submit_key = replay_cache_key("v2_submit", signature)
+        status_key = replay_cache_key("v2_status", signature)
 
         self.assertEqual(len(v1_key), 64)
         self.assertEqual(len(legacy_key), 64)
-        self.assertNotEqual(v1_key, legacy_key)
-        self.assertNotIn(signature, v1_key)
-        self.assertNotIn(signature, legacy_key)
+        self.assertEqual(len({v1_key, legacy_key, submit_key, status_key}), 4)
+        for key in (v1_key, legacy_key, submit_key, status_key):
+            self.assertNotIn(signature, key)
 
     def test_trusted_agent_path_requires_the_baked_outer_worker_file(self):
         from worker import modal_app
@@ -1031,6 +1124,343 @@ class ModalAsyncExecutionTests(unittest.IsolatedAsyncioTestCase):
         output = normalize_command_output("\x1b[1G\x1b[0K\x1b[31mnpm error\x1b[39m\r\nnext\x07\ufffd[1G")
 
         self.assertEqual(output, "npm error\nnext")
+
+
+class AsyncValidationApiTests(unittest.TestCase):
+    def assert_signed(self, secret, response):
+        self.assertTrue(
+            verify_signature(secret, response.content, response.headers["x-sentinel-worker-signature"])
+        )
+        self.assertEqual(response.headers["cache-control"], "no-store")
+
+    def test_v2_submit_returns_a_signed_queued_receipt_without_waiting_for_execution(self):
+        secret = "x" * 32
+        body = async_submit_body()
+        store = FakeAsyncJobStore()
+        spawner = AsyncMock()
+        started = time.monotonic()
+        with patch.dict(
+            os.environ,
+            {
+                "SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret,
+                LEGACY_SIGNATURE_COMPATIBILITY_ENV: "true",
+            },
+            clear=False,
+        ):
+            response = TestClient(
+                create_api(
+                    replay_reserver=AsyncMock(return_value=True),
+                    async_job_reserver=store.reserve,
+                    async_job_reader=store.read,
+                    async_job_writer=store.write,
+                    async_job_spawner=spawner,
+                )
+            ).post("/v2/validations/submit", content=body, headers=signed_headers(secret, body))
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(
+            response.json(),
+            {
+                "version": 1,
+                "jobId": valid_job()["jobId"],
+                "repository": {"commitSha": valid_job()["repository"]["commitSha"]},
+                "status": "queued",
+            },
+        )
+        self.assertLess(time.monotonic() - started, 1.0)
+        spawner.assert_awaited_once_with(valid_job())
+        self.assert_signed(secret, response)
+
+    def test_v2_rejects_legacy_signatures_even_when_v1_compatibility_is_enabled(self):
+        secret = "x" * 32
+        body = async_submit_body()
+        replay_reserver = AsyncMock(return_value=True)
+        with patch.dict(
+            os.environ,
+            {
+                "SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret,
+                LEGACY_SIGNATURE_COMPATIBILITY_ENV: "true",
+            },
+            clear=False,
+        ):
+            response = TestClient(create_api(replay_reserver=replay_reserver)).post(
+                "/v2/validations/submit",
+                content=body,
+                headers=signed_headers(secret, body, legacy=True),
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["failureCategory"], "result_invalid")
+        replay_reserver.assert_not_awaited()
+        self.assert_signed(secret, response)
+
+    def test_v2_rejects_stale_timestamp_before_job_storage(self):
+        secret = "x" * 32
+        body = async_submit_body()
+        store = FakeAsyncJobStore()
+        stale = str(int((time.time() - 301) * 1000))
+        with patch.dict(os.environ, {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret}, clear=False):
+            response = TestClient(
+                create_api(async_job_reserver=store.reserve)
+            ).post("/v2/validations/submit", content=body, headers=signed_headers(secret, body, timestamp=stale))
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(store.reserve_calls, 0)
+        self.assert_signed(secret, response)
+
+    def test_v2_replayed_submit_is_rejected_and_duplicate_job_is_not_spawned_twice(self):
+        secret = "x" * 32
+        body = async_submit_body()
+        store = FakeAsyncJobStore()
+        replay_reserver = AsyncMock(side_effect=[True, False])
+        spawner = AsyncMock()
+        api = create_api(
+            replay_reserver=replay_reserver,
+            async_job_reserver=store.reserve,
+            async_job_reader=store.read,
+            async_job_writer=store.write,
+            async_job_spawner=spawner,
+        )
+        headers = signed_headers(secret, body)
+        with patch.dict(os.environ, {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret}, clear=False):
+            client = TestClient(api)
+            accepted = client.post("/v2/validations/submit", content=body, headers=headers)
+            replayed = client.post("/v2/validations/submit", content=body, headers=headers)
+
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(replayed.status_code, 401)
+        self.assertEqual(spawner.await_count, 1)
+        self.assert_signed(secret, accepted)
+        self.assert_signed(secret, replayed)
+
+    def test_v2_duplicate_job_with_a_fresh_signature_reuses_the_receipt(self):
+        secret = "x" * 32
+        body = async_submit_body()
+        store = FakeAsyncJobStore()
+        spawner = AsyncMock()
+        api = create_api(
+            replay_reserver=AsyncMock(return_value=True),
+            async_job_reserver=store.reserve,
+            async_job_reader=store.read,
+            async_job_writer=store.write,
+            async_job_spawner=spawner,
+        )
+        timestamp = int(time.time() * 1000)
+        with patch.dict(os.environ, {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret}, clear=False):
+            client = TestClient(api)
+            first = client.post("/v2/validations/submit", content=body, headers=signed_headers(secret, body, timestamp=str(timestamp)))
+            second = client.post("/v2/validations/submit", content=body, headers=signed_headers(secret, body, timestamp=str(timestamp + 1)))
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 202)
+        self.assertEqual(spawner.await_count, 1)
+        self.assertEqual(len(store.states), 1)
+
+    def test_v2_status_is_authenticated_replay_protected_and_returns_signed_result(self):
+        secret = "x" * 32
+        body = async_status_body()
+        store = FakeAsyncJobStore()
+        job = valid_job()
+        queued = queued_async_job_state(job, timestamp_ms=1_786_896_000_000)
+        running = {**queued, "status": "running", "startedAt": 1_786_896_000_001, "updatedAt": 1_786_896_000_001}
+        store.states[job["jobId"]] = completed_async_job_state(
+            running,
+            successful_result(),
+            timestamp_ms=1_786_896_000_002,
+        )
+        replay_reserver = AsyncMock(side_effect=[True, False])
+        api = create_api(replay_reserver=replay_reserver, async_job_reader=store.read)
+        headers = signed_headers(secret, body)
+        with patch.dict(os.environ, {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret}, clear=False):
+            client = TestClient(api)
+            completed = client.post("/v2/validations/status", content=body, headers=headers)
+            replayed = client.post("/v2/validations/status", content=body, headers=headers)
+
+        self.assertEqual(completed.status_code, 200)
+        self.assertEqual(completed.json()["status"], "completed")
+        self.assertEqual(completed.json()["result"], successful_result())
+        self.assertEqual(replayed.status_code, 401)
+        self.assert_signed(secret, completed)
+        self.assert_signed(secret, replayed)
+
+    def test_v2_status_rejects_wrong_commit_and_handles_unknown_job_safely(self):
+        secret = "x" * 32
+        store = FakeAsyncJobStore()
+        job = valid_job()
+        store.states[job["jobId"]] = queued_async_job_state(job)
+        api = create_api(replay_reserver=AsyncMock(return_value=True), async_job_reader=store.read)
+        wrong_body = async_status_body(commit_sha="b" * 40)
+        unknown_store = FakeAsyncJobStore()
+        unknown_api = create_api(replay_reserver=AsyncMock(return_value=True), async_job_reader=unknown_store.read)
+        unknown_body = async_status_body()
+        with patch.dict(os.environ, {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret}, clear=False):
+            wrong = TestClient(api).post("/v2/validations/status", content=wrong_body, headers=signed_headers(secret, wrong_body))
+            unknown = TestClient(unknown_api).post("/v2/validations/status", content=unknown_body, headers=signed_headers(secret, unknown_body))
+
+        self.assertEqual(wrong.status_code, 404)
+        self.assertEqual(wrong.json()["failureCategory"], "result_invalid")
+        self.assertEqual(unknown.status_code, 404)
+        self.assertEqual(unknown.json()["failureCategory"], "job_expired")
+        self.assert_signed(secret, wrong)
+        self.assert_signed(secret, unknown)
+
+    def test_v2_status_fails_closed_for_a_result_with_the_wrong_binding(self):
+        secret = "x" * 32
+        job = valid_job()
+        state = queued_async_job_state(job)
+        state = {**state, "status": "running", "startedAt": state["updatedAt"]}
+        result = successful_result()
+        result["repository"] = {"commitSha": "b" * 40}
+        corrupted = {
+            **state,
+            "status": "completed",
+            "completedAt": state["updatedAt"],
+            "result": result,
+        }
+        store = FakeAsyncJobStore()
+        store.states[job["jobId"]] = corrupted
+        body = async_status_body()
+        with patch.dict(os.environ, {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret}, clear=False):
+            response = TestClient(
+                create_api(replay_reserver=AsyncMock(return_value=True), async_job_reader=store.read)
+            ).post("/v2/validations/status", content=body, headers=signed_headers(secret, body))
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["failureCategory"], "result_invalid")
+        self.assert_signed(secret, response)
+
+    def test_v2_status_returns_a_signed_fixed_failure_category(self):
+        secret = "x" * 32
+        job = valid_job()
+        store = FakeAsyncJobStore()
+        store.states[job["jobId"]] = {
+            **queued_async_job_state(job),
+            "status": "failed",
+            "completedAt": 1_786_896_000_001,
+            "updatedAt": 1_786_896_000_001,
+            "failureCategory": "worker_timeout",
+        }
+        body = async_status_body()
+        with patch.dict(os.environ, {"SENTINEL_VALIDATION_WORKER_SHARED_SECRET": secret}, clear=False):
+            response = TestClient(
+                create_api(replay_reserver=AsyncMock(return_value=True), async_job_reader=store.read)
+            ).post("/v2/validations/status", content=body, headers=signed_headers(secret, body))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "failed")
+        self.assertEqual(response.json()["failureCategory"], "worker_timeout")
+        self.assert_signed(secret, response)
+
+
+class AsyncValidationBackgroundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_modal_background_and_durable_state_calls_use_async_sdk_interfaces(self):
+        job = valid_job()
+        put = AioOnlyCall(return_value=True)
+        spawn = AioOnlyCall(return_value=SimpleNamespace(object_id="fc-safe"))
+        with patch("worker.modal_app.ASYNC_VALIDATION_JOB_STATE.put", new=put), patch(
+            "worker.modal_app.execute_async_validation_background",
+            new=SimpleNamespace(spawn=spawn),
+        ):
+            self.assertTrue(await reserve_async_validation_job(job))
+            self.assertTrue(await reserve_async_execution_claim(job))
+            await spawn_async_validation_job(job)
+
+        self.assertEqual(put.aio.await_count, 2)
+        spawn.aio.assert_awaited_once_with(job)
+
+    async def test_background_state_moves_from_queued_to_running_to_completed(self):
+        store = FakeAsyncJobStore()
+        job = valid_job()
+        self.assertTrue(await store.reserve(job))
+        executor = AsyncMock(return_value=successful_result())
+
+        await run_async_validation_background(
+            job,
+            claim_reserver=store.claim,
+            job_reader=store.read,
+            job_writer=store.write,
+            executor=executor,
+        )
+
+        self.assertEqual([state["status"] for state in store.writes], ["running", "completed"])
+        self.assertEqual(store.states[job["jobId"]]["status"], "completed")
+        self.assertEqual(async_status_payload(store.states[job["jobId"]])["result"], successful_result())
+        executor.assert_awaited_once_with(job)
+
+    async def test_background_failure_is_stored_as_a_fixed_safe_category(self):
+        store = FakeAsyncJobStore()
+        job = valid_job()
+        await store.reserve(job)
+
+        await run_async_validation_background(
+            job,
+            claim_reserver=store.claim,
+            job_reader=store.read,
+            job_writer=store.write,
+            executor=AsyncMock(side_effect=RuntimeError("sensitive provider detail")),
+        )
+
+        state = store.states[job["jobId"]]
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["failureCategory"], "internal_error")
+        self.assertNotIn("sensitive provider detail", json.dumps(state))
+
+    async def test_background_timeout_is_stored_as_a_fixed_safe_category(self):
+        store = FakeAsyncJobStore()
+        job = valid_job()
+        await store.reserve(job)
+
+        async def time_out(awaitable, *, timeout):
+            del timeout
+            awaitable.close()
+            raise TimeoutError
+
+        with patch("worker.modal_app.asyncio.wait_for", new=time_out):
+            await run_async_validation_background(
+                job,
+                claim_reserver=store.claim,
+                job_reader=store.read,
+                job_writer=store.write,
+                executor=AsyncMock(),
+            )
+
+        state = store.states[job["jobId"]]
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["failureCategory"], "worker_timeout")
+
+    async def test_duplicate_background_invocations_execute_the_job_only_once(self):
+        store = FakeAsyncJobStore()
+        job = valid_job()
+        await store.reserve(job)
+
+        async def execute(_job):
+            await asyncio.sleep(0)
+            return successful_result()
+
+        executor = AsyncMock(side_effect=execute)
+        await asyncio.gather(
+            run_async_validation_background(job, claim_reserver=store.claim, job_reader=store.read, job_writer=store.write, executor=executor),
+            run_async_validation_background(job, claim_reserver=store.claim, job_reader=store.read, job_writer=store.write, executor=executor),
+        )
+
+        self.assertEqual(executor.await_count, 1)
+        self.assertEqual(store.states[job["jobId"]]["status"], "completed")
+
+    async def test_durable_state_never_contains_request_content_or_credentials(self):
+        store = FakeAsyncJobStore()
+        job = valid_job()
+        await store.reserve(job)
+        await run_async_validation_background(
+            job,
+            claim_reserver=store.claim,
+            job_reader=store.read,
+            job_writer=store.write,
+            executor=AsyncMock(return_value=successful_result()),
+        )
+
+        stored = json.dumps(store.states[job["jobId"]], sort_keys=True)
+        for forbidden in ("proposedFix", "dependencyType", "octo-org", "shared_secret", "github_token", "signature"):
+            self.assertNotIn(forbidden, stored)
 
 
 if __name__ == "__main__":
