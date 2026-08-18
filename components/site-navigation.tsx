@@ -26,9 +26,9 @@ export async function SiteNavigation() {
           aria-label="Sentinel home"
           className="group flex shrink-0 items-center gap-3 text-[#171817] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#171817] focus-visible:ring-offset-2 focus-visible:ring-offset-[#f5f5ef]"
         >
-          <span className="relative grid h-9 w-9 place-items-center border border-[#171817] bg-[#d8ff42] text-[#171817] transition-transform group-hover:-translate-y-0.5">
+          <span className="relative grid h-9 w-9 place-items-center border border-[#171817] bg-[#d8ff42] text-[#171817] transition-transform group-hover:-translate-y-0.5 dark:!border-[#252a30] dark:!bg-[#111417] dark:!text-[#d8ff42]">
             <ShieldCheck className="h-5 w-5" />
-            <span className="absolute -right-1 -top-1 h-2 w-2 border border-[#171817] bg-[#f5f5ef]" />
+            <span className="absolute -right-1 -top-1 h-2 w-2 border border-[#171817] bg-[#f5f5ef] dark:!border-[#252a30] dark:!bg-[#080a0c]" />
           </span>
           <span>
             <span className="block text-base font-medium tracking-[-.045em]">
@@ -46,7 +46,7 @@ export async function SiteNavigation() {
             <ThemeToggle />
 
             <div className="hidden items-center gap-2.5 border-l border-[#d5d6ce] pl-3 xl:flex">
-              <span className="grid h-8 w-8 shrink-0 place-items-center border border-[#171817] bg-[#ecece5] font-mono text-xs font-medium text-[#171817]">
+              <span className="grid h-8 w-8 shrink-0 place-items-center border border-[#171817] bg-[#ecece5] font-mono text-xs font-medium text-[#171817] dark:!border-[#252a30] dark:!bg-[#161a1e] dark:!text-[#f5f7fa]">
                 {userInitial}
               </span>
               <span className="max-w-36 min-w-0">

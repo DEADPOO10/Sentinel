@@ -21,5 +21,5 @@ export function ThemeToggle() {
     setIsDark(nextIsDark);
   }
 
-  return <button type="button" aria-label={label} title={label} onClick={toggleTheme} className="inline-flex h-9 w-9 items-center justify-center border border-transparent text-[#5f625d] transition-colors hover:border-[#d5d6ce] hover:bg-[#ecece5] hover:text-[#171817] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#171817] focus-visible:ring-offset-2 focus-visible:ring-offset-[#f5f5ef]">{mounted && isDark ? <Sun className="h-4 w-4" aria-hidden="true" /> : <Moon className="h-4 w-4" aria-hidden="true" />}</button>;
+  return <button type="button" aria-label={label} title={label} onClick={toggleTheme} className="inline-flex h-9 w-9 items-center justify-center border border-transparent text-[#5f625d] transition-colors hover:border-[#d5d6ce] hover:bg-[#ecece5] hover:text-[#171817] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#171817] focus-visible:ring-offset-2 focus-visible:ring-offset-[#f5f5ef] dark:text-[#9ca3af] dark:hover:border-[#252a30] dark:hover:bg-[#161a1e] dark:hover:text-[#d8ff42]">{mounted && isDark ? <Sun className="h-4 w-4" aria-hidden="true" /> : <Moon className="h-4 w-4" aria-hidden="true" />}</button>;
 }

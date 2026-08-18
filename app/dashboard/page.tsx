@@ -47,7 +47,7 @@ export default async function DashboardPage() {
             </div>
 
             <div className="border-t border-[#d5d6ce] pt-6 lg:border-l lg:border-t-0 lg:pl-7 lg:pt-0">
-              <Badge variant="success" className="px-3 py-1.5">
+              <Badge variant="brand" className="px-3 py-1.5">
                 Human-controlled workflow
               </Badge>
               <p className="mt-4 font-mono text-[10px] uppercase leading-5 tracking-[.1em] text-[#696b66]">

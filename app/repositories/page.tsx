@@ -116,9 +116,9 @@ export default async function RepositoriesPage() {
                           </>
                         )}
                       </Badge>
-                      <Badge variant="default">
+                      <Badge variant="brand-subtle">
                         <span
-                          className="h-1.5 w-1.5 bg-[#696b66]"
+                          className="h-1.5 w-1.5 bg-[#696b66] dark:bg-[#d8ff42]"
                           aria-hidden="true"
                         />
                         Ready to monitor

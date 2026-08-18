@@ -3,7 +3,6 @@ import {
   Github,
   Mail,
   ShieldCheck,
-  UserRound,
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { requireUser } from "@/lib/auth/session";
@@ -32,8 +31,8 @@ export default async function SettingsPage() {
           <div className="flex flex-col justify-between gap-7 px-6 py-8 sm:px-8 lg:flex-row lg:items-end lg:px-10 lg:py-10">
             <div className="max-w-3xl">
               <div className="mb-5 flex items-center gap-2">
-                <span className="grid h-8 w-8 place-items-center border border-[#171817] bg-[#d8ff42] text-[#171817]">
-                  <UserRound className="h-4 w-4" />
+                <span className="grid h-8 w-8 place-items-center border border-[#171817] bg-[#d8ff42] text-[#171817] dark:!border-[#252a30] dark:!bg-[#111417] dark:!text-[#d8ff42]">
+                  <ShieldCheck className="h-4 w-4" />
                 </span>
                 <p className="eyebrow">SENTINEL / WORKSPACE SETTINGS</p>
               </div>
@@ -68,7 +67,7 @@ export default async function SettingsPage() {
           <Card className="overflow-hidden">
             <div className="grid lg:grid-cols-[1fr_22rem]">
               <CardHeader className="flex-row items-center gap-5 p-6 sm:p-8">
-                <span className="grid h-16 w-16 shrink-0 place-items-center border border-[#171817] bg-[#d8ff42] text-2xl font-medium tracking-[-.04em] text-[#171817]">
+                <span className="grid h-16 w-16 shrink-0 place-items-center border border-[#171817] bg-[#d8ff42] text-2xl font-medium tracking-[-.04em] text-[#171817] dark:!border-[#d8ff42] dark:!bg-[#111417] dark:!text-[#d8ff42]">
                   {userInitial}
                 </span>
                 <div className="min-w-0">
@@ -76,7 +75,7 @@ export default async function SettingsPage() {
                     <CardTitle className="truncate text-2xl">
                       {displayName}
                     </CardTitle>
-                    <Badge variant="success">Active</Badge>
+                    <Badge variant="brand">Active</Badge>
                   </div>
                   <CardDescription className="mt-2">
                     {user.username
@@ -123,9 +122,9 @@ export default async function SettingsPage() {
                   <span className="grid h-10 w-10 place-items-center border border-[#171817] bg-[#171817] text-[#f5f5ef]">
                     <Github className="h-5 w-5" />
                   </span>
-                  <Badge variant="success">
+                  <Badge variant="brand">
                     <span
-                      className="h-1.5 w-1.5 bg-[#237a53]"
+                      className="h-1.5 w-1.5 bg-[#237a53] dark:bg-[#d8ff42]"
                       aria-hidden="true"
                     />
                     Connected

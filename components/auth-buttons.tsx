@@ -79,8 +79,8 @@ export function SiteNavigationLinks({
             aria-label={link.label}
             className={`relative inline-flex h-10 items-center gap-2 border px-2.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#171817] focus-visible:ring-offset-2 focus-visible:ring-offset-[#f5f5ef] sm:px-3 ${
               isActive
-                ? "border-[#171817] bg-[#ecece5] text-[#171817] after:absolute after:inset-x-2 after:-bottom-px after:h-0.5 after:bg-[#d8ff42]"
-                : "border-transparent text-[#696b66] hover:border-[#d5d6ce] hover:bg-[#ecece5] hover:text-[#171817]"
+                ? "border-[#171817] bg-[#ecece5] text-[#171817] after:absolute after:inset-x-2 after:-bottom-px after:h-0.5 after:bg-[#d8ff42] dark:!border-[#252a30] dark:!bg-[#161a1e] dark:!text-[#f5f7fa]"
+                : "border-transparent text-[#696b66] hover:border-[#d5d6ce] hover:bg-[#ecece5] hover:text-[#171817] dark:text-[#9ca3af] dark:hover:border-[#252a30] dark:hover:bg-[#161a1e] dark:hover:text-[#f5f7fa]"
             }`}
           >
             <Icon className="h-4 w-4 shrink-0" />

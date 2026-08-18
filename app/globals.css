@@ -27,7 +27,7 @@
   --ink-soft: #e5e7eb;
   --line: #252a30;
   --muted: #9ca3af;
-  --acid: #c7ff00;
+  --acid: #d8ff42;
   --success: #71d7a1;
   --warning: #ffd166;
   --danger: #ff8f8f;
@@ -61,14 +61,14 @@ body { background: var(--background); color: var(--foreground); font-family: var
 .dark .sentinel-page .bg-\[\#ecece5\] { background-color: #171b1f; }
 .dark .sentinel-page .bg-\[\#171817\],
 .dark .sentinel-page .bg-\[\#2a2b29\] { background-color: #111417; }
-.dark .sentinel-page .bg-\[\#d8ff42\] { background-color: #c7ff00; }
+.dark .sentinel-page .bg-\[\#d8ff42\] { background-color: #d8ff42; }
 
 .dark .sentinel-page .border-\[\#d5d6ce\],
 .dark .sentinel-page .border-\[\#d5d6ce\]\/80,
 .dark .sentinel-page .border-\[\#cbd0c6\],
 .dark .sentinel-page .border-\[\#c7c9bf\],
 .dark .sentinel-page .border-\[\#bfc1b7\] { border-color: #252a30; }
-.dark .sentinel-page .border-\[\#171817\] { border-color: #f5f7fa; }
+.dark .sentinel-page .border-\[\#171817\] { border-color: #252a30; }
 
 .dark .sentinel-page .text-\[\#171817\] { color: #f5f7fa; }
 .dark .sentinel-page .text-\[\#343633\] { color: #e5e7eb; }
@@ -80,10 +80,10 @@ body { background: var(--background); color: var(--foreground); font-family: var
 .dark .sentinel-page .hover\:bg-white:hover,
 .dark .sentinel-page .hover\:bg-\[\#ecece5\]:hover,
 .dark .sentinel-page .hover\:bg-\[\#f1f1ec\]:hover { background-color: #1a1f24; }
-.dark .sentinel-page .hover\:border-\[\#171817\]:hover { border-color: #c7ff00; }
+.dark .sentinel-page .hover\:border-\[\#171817\]:hover { border-color: #d8ff42; }
 .dark .sentinel-page .hover\:text-\[\#171817\]:hover,
 .dark .sentinel-page .hover\:text-\[\#343633\]:hover { color: #f5f7fa; }
-.dark .sentinel-page .ring-\[\#171817\] { --tw-ring-color: #c7ff00; }
+.dark .sentinel-page .ring-\[\#171817\] { --tw-ring-color: #d8ff42; }
 .dark .sentinel-page .ring-offset-\[\#f5f5ef\] { --tw-ring-offset-color: #080a0c; }
 
 .dark .sentinel-page .bg-emerald-50 { background-color: #10261d; }

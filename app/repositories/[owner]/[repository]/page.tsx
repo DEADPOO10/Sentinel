@@ -280,7 +280,7 @@ function ScanSnapshotStatus({
       role="status"
     >
       <span
-        className={`font-medium ${isFresh ? "text-emerald-800" : "text-amber-800"}`}
+        className={`font-medium ${isFresh ? "text-emerald-800 dark:!text-[#d8ff42]" : "text-amber-800"}`}
       >
         {isFresh ? "CACHED · FRESH" : "CACHED · STALE"}
       </span>
@@ -324,8 +324,8 @@ function RepositoryOverview({
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-3 lg:justify-end">
-          <Badge variant="success" className="px-3 py-1.5">
-            <span className="h-1.5 w-1.5 bg-[#237a53]" aria-hidden="true" />
+          <Badge variant="brand" className="px-3 py-1.5">
+            <span className="h-1.5 w-1.5 bg-[#237a53] dark:bg-[#d8ff42]" aria-hidden="true" />
             Monitoring active
           </Badge>
           <span className="inline-flex items-center gap-2 border border-[#d5d6ce] bg-[#f5f5ef] px-3 py-2 font-mono text-xs text-[#5f625d]">
