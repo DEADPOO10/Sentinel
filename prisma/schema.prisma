@@ -89,16 +89,32 @@ enum RateLimitWindow {
   DAILY
 }
 
+enum ValidationJobStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum ValidationJobFailureCategory {
+  WORKER_UNAVAILABLE
+  WORKER_TIMEOUT
+  RESULT_INVALID
+  JOB_EXPIRED
+  INTERNAL_ERROR
+}
+
 model User {
-  id           String           @id @default(cuid())
-  githubUserId String           @unique
-  githubLogin  String
-  name         String?
-  email        String?
-  avatarUrl    String?
-  createdAt    DateTime         @default(now())
-  updatedAt    DateTime         @updatedAt
-  repositories UserRepository[]
+  id             String           @id @default(cuid())
+  githubUserId   String           @unique
+  githubLogin    String
+  name           String?
+  email          String?
+  avatarUrl      String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  repositories   UserRepository[]
+  validationJobs ValidationJob[]
 
   @@index([githubLogin])
 }
@@ -117,6 +133,7 @@ model Repository {
   updatedAt          DateTime             @updatedAt
   users              UserRepository[]
   scans              Scan[]
+  validationJobs     ValidationJob[]
 
   @@index([fullName])
   @@index([owner, name])
@@ -201,6 +218,7 @@ model ProposedFix {
   createdAt             DateTime          @default(now())
   finding               Finding           @relation(fields: [findingId], references: [id], onDelete: Restrict)
   validationRuns        ValidationRun[]
+  validationJobs        ValidationJob[]
   pullRequest           PullRequest?
 
   @@index([findingId, createdAt])
@@ -227,6 +245,31 @@ model ValidationRun {
 
   @@index([proposedFixId, createdAt])
   @@index([overallStatus])
+}
+
+model ValidationJob {
+  id                       String                        @id @default(uuid())
+  userId                   String
+  repositoryId             String
+  proposedFixId            String
+  proposedChangeIdentifier String
+  baseCommitSha            String
+  idempotencyKey           String                        @unique
+  status                   ValidationJobStatus           @default(QUEUED)
+  failureCategory          ValidationJobFailureCategory?
+  createdAt                DateTime                      @default(now())
+  startedAt                DateTime?
+  completedAt              DateTime?
+  updatedAt                DateTime                      @updatedAt
+  expiresAt                DateTime
+  user                     User                          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  repository               Repository                    @relation(fields: [repositoryId], references: [id], onDelete: Restrict)
+  proposedFix              ProposedFix                   @relation(fields: [proposedFixId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@index([repositoryId, createdAt])
+  @@index([proposedFixId, createdAt])
+  @@index([status, expiresAt])
 }
 
 model PullRequest {
