@@ -9,6 +9,7 @@ import { redirect } from "next/navigation";
 import type { ReactNode } from "react";
 import { auth } from "@/auth";
 import { SignInWithGitHubButton } from "@/components/auth-buttons";
+import { SentinelBrandMark } from "@/components/sentinel-brand-mark";
 import { SiteNavigation } from "@/components/site-navigation";
 import { Badge } from "@/components/ui/badge";
 
@@ -25,11 +26,11 @@ export default async function LoginPage() {
           <div className="absolute inset-x-0 top-0 h-1 bg-[#d8ff42]" />
           <div className="relative max-w-2xl">
             <div className="mb-7 flex items-center gap-3">
-              <span className="grid h-10 w-10 place-items-center border border-[#171817] bg-[#d8ff42] text-[#171817]">
-                <ShieldCheck className="h-5 w-5" />
+              <span className="grid h-10 w-10 place-items-center rounded-[0.35rem] bg-[#111417] p-1">
+                <SentinelBrandMark />
               </span>
               <div>
-                <p className="text-lg font-medium tracking-[-.04em] text-[#171817]">
+                <p className="text-lg font-normal tracking-[-.04em] text-[#171817]">
                   Sentinel
                 </p>
                 <p className="font-mono text-[9px] uppercase tracking-[.16em] text-[#8a8d86]">

@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 
 import { SiteNavigation } from "@/components/site-navigation";
+import { SentinelBrandMark } from "@/components/sentinel-brand-mark";
 import { Button } from "@/components/ui/button";
 
 const capabilities = [
@@ -314,8 +315,8 @@ function ProductPanel() {
       <div className="relative flex h-full min-h-[560px] flex-col">
         <div className="flex items-center justify-between border-b border-white/15 pb-5">
           <div className="flex items-center gap-3">
-            <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#d8ff42] text-[#171817]">
-              <Radar className="h-5 w-5" aria-hidden="true" />
+            <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#111417] p-1">
+              <SentinelBrandMark />
             </span>
             <div>
               <p className="text-sm font-semibold">Maintenance intelligence</p>
@@ -380,10 +381,10 @@ function Footer() {
     <footer className="border-t border-[#d5d6ce]">
       <div className="mx-auto flex w-full max-w-[1440px] flex-col gap-6 px-5 py-8 text-xs text-[#62645c] sm:px-8 md:flex-row md:items-center md:justify-between lg:px-12">
         <div className="flex items-center gap-3">
-          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#171817] text-[#d8ff42]">
-            <Radar className="h-4 w-4" aria-hidden="true" />
+          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#111417] p-1">
+            <SentinelBrandMark />
           </span>
-          <span className="font-semibold uppercase tracking-[0.16em] text-[#171817]">
+          <span className="font-medium uppercase tracking-[0.16em] text-[#171817]">
             Sentinel
           </span>
           <span aria-hidden="true">/</span>

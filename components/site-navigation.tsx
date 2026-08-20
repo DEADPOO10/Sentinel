@@ -1,9 +1,9 @@
 import Link from "next/link";
-import { ShieldCheck } from "lucide-react";
 import {
   SignOutButton,
   SiteNavigationLinks,
 } from "@/components/auth-buttons";
+import { SentinelBrandMark } from "@/components/sentinel-brand-mark";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import { getCurrentUser } from "@/lib/auth/session";
@@ -26,12 +26,11 @@ export async function SiteNavigation() {
           aria-label="Sentinel home"
           className="group flex shrink-0 items-center gap-3 text-[#171817] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#171817] focus-visible:ring-offset-2 focus-visible:ring-offset-[#f5f5ef]"
         >
-          <span className="relative grid h-9 w-9 place-items-center border border-[#171817] bg-[#d8ff42] text-[#171817] transition-transform group-hover:-translate-y-0.5 dark:!border-[#252a30] dark:!bg-[#111417] dark:!text-[#d8ff42]">
-            <ShieldCheck className="h-5 w-5" />
-            <span className="absolute -right-1 -top-1 h-2 w-2 border border-[#171817] bg-[#f5f5ef] dark:!border-[#252a30] dark:!bg-[#080a0c]" />
+          <span className="grid h-9 w-9 place-items-center rounded-[0.35rem] bg-[#111417] p-1 transition-transform group-hover:-translate-y-0.5 dark:!bg-[#111417]">
+            <SentinelBrandMark />
           </span>
           <span>
-            <span className="block text-base font-medium tracking-[-.045em]">
+            <span className="block text-base font-normal tracking-[-.045em]">
               sentinel
             </span>
             <span className="hidden font-mono text-[8px] uppercase tracking-[.14em] text-[#8a8d86] xl:block">
