@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { requireUser } from "@/lib/auth/session";
+import { SentinelBrandMark } from "@/components/sentinel-brand-mark";
 import { SiteNavigation } from "@/components/site-navigation";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -31,8 +32,8 @@ export default async function SettingsPage() {
           <div className="flex flex-col justify-between gap-7 px-6 py-8 sm:px-8 lg:flex-row lg:items-end lg:px-10 lg:py-10">
             <div className="max-w-3xl">
               <div className="mb-5 flex items-center gap-2">
-                <span className="grid h-8 w-8 place-items-center border border-[#171817] bg-[#d8ff42] text-[#171817] dark:!border-[#252a30] dark:!bg-[#111417] dark:!text-[#d8ff42]">
-                  <ShieldCheck className="h-4 w-4" />
+                <span className="grid h-8 w-8 place-items-center rounded-[0.35rem] bg-[#111417] p-1">
+                  <SentinelBrandMark />
                 </span>
                 <p className="eyebrow">SENTINEL / WORKSPACE SETTINGS</p>
               </div>
